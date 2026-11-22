@@ -5,5 +5,10 @@ strategy("Probe 05 MTF daily", overlay = true)
 dPrevOn = request.security(syminfo.tickerid, "D", close[1], lookahead = barmerge.lookahead_on)
 dDefault = request.security(syminfo.tickerid, "D", close)
 
+// Tuple form, as KyberSwing uses it: [close[1], ema[1]] in one request.
+[tClose, tEma] = request.security(syminfo.tickerid, "D", [close[1], ta.ema(close, 3)[1]], lookahead = barmerge.lookahead_on)
+
 plot(dPrevOn, "prevOn")
 plot(dDefault, "default")
+plot(tClose, "tupleClose")
+plot(tEma, "tupleEma")

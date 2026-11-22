@@ -139,6 +139,8 @@ export interface BrokerTrade {
   entry_price: number;
   entry_bar_index: number;
   entry_time: number;
+  /** Unrealised P&L of the trade, as our broker marks it. */
+  profit?: number;
 }
 
 /** What the script reads back. Our broker owns these numbers. */
@@ -216,6 +218,7 @@ function scalarList(list: BrokerTrade[]) {
     entry_id: (i: unknown) => at(i)?.id ?? '',
     entry_bar_index: (i: unknown) => at(i)?.entry_bar_index ?? NaN,
     entry_time: (i: unknown) => at(i)?.entry_time ?? NaN,
+    profit: (i: unknown) => at(i)?.profit ?? 0,
   };
 }
 
@@ -233,6 +236,8 @@ export interface HookedScript {
   indicator: Indicator;
   calls: OrderCall[];
   lastContext: () => Ctx | null;
+  /** How many times the namespace was patched (once per run context). */
+  patchCount: () => number;
 }
 
 export function hookScript(source: string, opts: HookOptions = {}): HookedScript {
@@ -243,6 +248,7 @@ export function hookScript(source: string, opts: HookOptions = {}): HookedScript
   let patched: Ctx | null = null;
   let view: BrokerView | null = null;
   let lastBar = -1;
+  let patchCount = 0;
 
   const patch = ($: Ctx) => {
     const ns = $.pine.strategy;
@@ -270,6 +276,7 @@ export function hookScript(source: string, opts: HookOptions = {}): HookedScript
       if (patched !== $) {
         patch($);
         patched = $;
+        patchCount++;
       }
       // Bars appended after the run started (bar-by-bar mode) also count for barstate.islast.
       if ($.length < $.marketData.length) $.length = $.marketData.length;
@@ -284,7 +291,7 @@ export function hookScript(source: string, opts: HookOptions = {}): HookedScript
   // The runtime reads these off the transpiled function.
   for (const k of ['_pineVersion', '_ltfSlices']) (wrapped as unknown as Record<string, unknown>)[k] = original[k];
   prepared.fn = wrapped as unknown as typeof prepared.fn;
-  return { indicator, calls, lastContext: () => patched };
+  return { indicator, calls, lastContext: () => patched, patchCount: () => patchCount };
 }
 
 export interface RunOptions extends HookOptions {
@@ -346,6 +353,8 @@ export interface StepperOptions extends RunOptions {
    *  - 'updateTail': PineTS's own refresh (gives wrong values, kept as evidence).
    */
   htfRefresh?: 'rebuild' | 'day-boundary' | 'updateTail';
+  /** Bars to warm up on before stepping: processed as one page, like a full run (warm start). */
+  history?: Candle[];
 }
 
 /**
@@ -354,24 +363,35 @@ export interface StepperOptions extends RunOptions {
  * `data.length` before every page, so a bar appended before next() is processed next.
  */
 export async function createStepper(source: string, opts: StepperOptions = {}) {
+  const history = opts.history ?? [];
   // With a provider, an eDate keeps PineTS out of its live-polling mode: we append bars ourselves.
-  const provider = opts.provider ? new MemoryProvider([]) : null;
-  const pine = provider ? new PineTS(provider, TICKER, CHART_TF, undefined, 0, Number.MAX_SAFE_INTEGER) : new PineTS([], TICKER, CHART_TF);
+  const provider = opts.provider ? new MemoryProvider(history) : null;
+  const pine = provider
+    ? new PineTS(provider, TICKER, CHART_TF, undefined, 0, Number.MAX_SAFE_INTEGER)
+    : new PineTS(history.map((c) => toKline(c, H4_MS)), TICKER, CHART_TF);
   await pine.ready();
+  const refresh: ((ctx: Ctx) => void) | undefined = !provider
+    ? undefined
+    : opts.htfRefresh === 'updateTail'
+      ? bumpDataVersion
+      : opts.htfRefresh === 'day-boundary'
+        ? ($) => {
+            const t = $.marketData[$.idx]!.openTime;
+            if (t % DAY_MS === 0 || (t + H4_MS) % DAY_MS === 0) dropSecurityCache($);
+          }
+        : dropSecurityCache;
   const hooked = hookScript(source, {
     ...opts,
-    onNewBar: !provider
-      ? undefined
-      : opts.htfRefresh === 'updateTail'
-        ? bumpDataVersion
-        : opts.htfRefresh === 'day-boundary'
-          ? ($) => {
-              const t = $.marketData[$.idx]!.openTime;
-              if (t % DAY_MS === 0 || (t + H4_MS) % DAY_MS === 0) dropSecurityCache($);
-            }
-          : dropSecurityCache,
+    // Warm-up bars run in one page with the security contexts built from the full history: no refresh.
+    onNewBar: refresh ? ($) => ($.idx >= history.length ? refresh($) : undefined) : undefined,
   });
-  const gen = pine.run(hooked.indicator, undefined, 1) as AsyncGenerator<Context>;
+  // One page holds the whole history (warm start, same speed as a full run); after that every
+  // next() finds exactly one appended bar.
+  const gen = pine.run(hooked.indicator, undefined, Math.max(history.length, 1)) as AsyncGenerator<Context>;
+  if (history.length > 0) {
+    const r = await gen.next();
+    if (r.done) throw new Error('PineTS paginated run ended during warm-up');
+  }
   return {
     calls: hooked.calls,
     pine,
@@ -383,6 +403,7 @@ export async function createStepper(source: string, opts: StepperOptions = {}) {
     },
     /** The run's context, as the hook last saw it. */
     context: () => hooked.lastContext(),
+    patchCount: () => hooked.patchCount(),
   };
 }
 
