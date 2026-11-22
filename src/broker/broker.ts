@@ -83,8 +83,12 @@ export class PaperBroker {
       const openQty = this.openingQty(i, qty);
       if (openQty > 0) {
         const need = this.marginAndFee(openQty, ref, i.leverage);
+        // A reversal frees the old position's margin but pays a fee on the closing leg.
+        const closeQty = qty - openQty;
+        const released = pos && closeQty > 0 ? (pos.margin * closeQty) / Math.abs(pos.qty) : 0;
+        const closeFee = tradeFee(closeQty, ref, this.o.fees.takerRate);
         // Pending opening orders already spoken for part of the free margin.
-        if (need > this.account().freeMargin - this.reservedMargin(i.id)) {
+        if (need > this.account().freeMargin - this.reservedMargin(i.id) + released - closeFee) {
           return { accepted: false, reason: 'no_free_balance' };
         }
       }
@@ -334,9 +338,11 @@ export class PaperBroker {
       // Re-check against the actual fill price; closing an opposing position frees its margin.
       const openQty = this.openingQty(ord, qty);
       if (openQty > 0) {
-        const released = pos && openQty < qty ? (pos.margin * Math.min(qty, Math.abs(pos.qty))) / Math.abs(pos.qty) : 0;
+        const closeQty = qty - openQty;
+        const released = pos && closeQty > 0 ? (pos.margin * closeQty) / Math.abs(pos.qty) : 0;
+        const closeFee = tradeFee(closeQty, price, maker ? this.o.fees.makerRate : this.o.fees.takerRate);
         const need = marginRequired(openQty, price, ord.leverage) + tradeFee(openQty, price, this.o.fees.takerRate);
-        if (need > this.account().freeMargin + released) {
+        if (need > this.account().freeMargin + released - closeFee) {
           this.rejected.push({ orderId: ord.id, symbol: ord.symbol, time, reason: 'no_free_balance' });
           return null;
         }

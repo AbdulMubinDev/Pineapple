@@ -91,6 +91,21 @@ describe('fixed sizing', () => {
   });
 });
 
+describe('fixed sizing at leverage 1', () => {
+  it('a full reversal is accepted and fills even when the new side needs more than current free margin', () => {
+    const b = make('tradingview', { kind: 'fixed', notionalUsd: 5000 }, 100);
+    expect(b.submit(order({ qty: 999, leverage: 1 }), 0)).toEqual({ accepted: true });
+    b.onBarOpen('BTCUSDT', bar(100, 100, 100, 100, 1000)); // long 50 @100.02, margin ~5001
+    expect(b.account().freeMargin).toBeLessThan(5000);
+    expect(b.submit(order({ side: 'sell', qty: 999, leverage: 1 }), 1)).toEqual({ accepted: true });
+    b.onBarOpen('BTCUSDT', bar(100, 100, 100, 100, 2000));
+    expect(b.rejections()).toEqual([]);
+    expect(b.position('BTCUSDT')?.qty).toBeCloseTo(-50, 8);
+    expect(b.closedTrades()).toHaveLength(1);
+    expect(b.account().freeMargin).toBeGreaterThan(0);
+  });
+});
+
 describe('reduce-only min notional', () => {
   it('reduce-only dust closes are accepted, normal orders are not', () => {
     const b = make();
@@ -150,9 +165,8 @@ describe('OCA', () => {
     expect(rest[0]!.qty).toBeCloseTo(0.2, 10);
   });
 
-  it('a group fills at most once per bar even without sibling removal', () => {
+  it('different OCA groups are independent and both fill in one bar', () => {
     const b = make('tradingview', { kind: 'script' }, 100);
-    // two different groups would both fill; same group must not
     b.submit(order({ id: 'a', type: 'limit', limitPrice: 99, qty: 0.1, ocaGroup: 'g' }), 0);
     b.submit(order({ id: 'b', type: 'limit', limitPrice: 97, qty: 0.1, ocaGroup: 'h' }), 0);
     const fills = b.onBarRange('BTCUSDT', bar(100, 101, 96, 100, 1000));
