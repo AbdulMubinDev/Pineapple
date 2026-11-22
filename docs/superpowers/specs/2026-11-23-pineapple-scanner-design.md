@@ -2,7 +2,7 @@
 
 Date: 2026-11-23 · Owner: Abdul Mubin
 
-The requirements come from `../../../../Pine Strategy Paper-Trading Scanner v1 Feature Spec.md` (the v1 spec, in the Code folder). This document doesn't repeat it. It records the decisions made on top of it and how the parts fit. When this doc and the spec disagree, this doc wins.
+The requirements come from `docs/spec/v1-feature-spec.md` (the v1 spec). This document doesn't repeat it. It records the decisions made on top of it and how the parts fit. When this doc and the spec disagree, this doc wins.
 
 ## Intent
 
