@@ -1,0 +1,11 @@
+// Probe 03: pyramiding up to 3 same-direction entries; reads strategy.opentrades.
+//@version=6
+strategy("Probe 03 pyramiding", overlay = true, initial_capital = 10000, pyramiding = 3, default_qty_type = strategy.fixed, default_qty_value = 0.01)
+
+if close > open and strategy.opentrades < 3
+    strategy.entry("L", strategy.long)
+if ta.crossunder(close, ta.sma(close, 50))
+    strategy.close_all()
+
+plot(strategy.opentrades, "opentrades")
+plot(strategy.position_size, "pos")

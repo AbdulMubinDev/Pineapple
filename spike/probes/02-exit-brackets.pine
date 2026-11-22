@@ -1,0 +1,22 @@
+// Probe 02: every order primitive - entry, exit (stop/limit bracket), close, order, cancel, cancel_all, close_all.
+//@version=6
+strategy("Probe 02 exit brackets", overlay = true, initial_capital = 10000, default_qty_type = strategy.fixed, default_qty_value = 0.1, commission_type = strategy.commission.percent, commission_value = 0.05)
+
+fast = ta.sma(close, 10)
+slow = ta.sma(close, 30)
+
+if ta.crossover(fast, slow)
+    strategy.entry("L", strategy.long, qty = 0.1, comment = "go long")
+    strategy.exit("L-x", from_entry = "L", stop = close * 0.97, limit = close * 1.05)
+if ta.crossunder(fast, slow)
+    strategy.close("L", comment = "cross down")
+
+// A resting limit order that is cancelled three bars later if still unfilled.
+if bar_index % 50 == 0
+    strategy.order("Dip", strategy.long, 0.05, limit = close * 0.9)
+if bar_index % 50 == 3
+    strategy.cancel("Dip")
+
+if bar_index % 500 == 499
+    strategy.cancel_all()
+    strategy.close_all(comment = "flatten")

@@ -1,0 +1,6 @@
+// Probe 06: an indicator() declaration (not a strategy) with arguments and an input.
+//@version=6
+indicator("Probe 06 indicator", shorttitle = "P06", overlay = false, precision = 2)
+
+len = input.int(14, "Length")
+plot(ta.rsi(close, len), "rsi")

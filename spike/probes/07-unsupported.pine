@@ -1,0 +1,10 @@
+// Probe 07: a valid TradingView script that uses functions PineTS may not support.
+//@version=6
+strategy("Probe 07 unsupported", overlay = true)
+
+eps = request.financial(syminfo.tickerid, "EARNINGS_PER_SHARE", "FQ")
+x = ta.sma(close, 10)
+y = request.economic("US", "GDP")
+plot(eps, "eps")
+plot(x, "sma")
+plot(y, "gdp")

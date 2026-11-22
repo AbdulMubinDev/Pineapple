@@ -1,0 +1,18 @@
+// Probe 04: sizing from strategy.equity, exits from strategy.position_avg_price; plots every broker read-back.
+//@version=6
+strategy("Probe 04 equity sizing", overlay = true, initial_capital = 10000, commission_type = strategy.commission.percent, commission_value = 0.05)
+
+qtyFromEquity = strategy.equity * 0.5 / close
+
+if strategy.position_size == 0 and close > ta.sma(close, 20)
+    strategy.entry("L", strategy.long, qty = qtyFromEquity)
+if strategy.position_size > 0 and close < strategy.position_avg_price * 0.98
+    strategy.close("L")
+
+plot(strategy.position_size, "pos")
+plot(strategy.position_avg_price, "avg")
+plot(strategy.equity, "equity")
+plot(strategy.opentrades, "opentrades")
+plot(strategy.netprofit, "netprofit")
+plot(qtyFromEquity, "qty")
+plot(strategy.position_size[1], "posPrev")

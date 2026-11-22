@@ -1,0 +1,29 @@
+// Probe 01: SMA 10/30 cross, always-in-market reversal strategy.
+//
+// TradingView reference settings (Strategy Properties tab), used for the owner's comparison:
+//   Chart:                 BINANCE:BTCUSDT.P, 4h
+//   Date range:            Jan 1 2024 - Nov 18 2026 (the script also gates new orders to this range)
+//   Initial capital:       10000
+//   Order size:            100 % of equity
+//   Commission:            0.05 %
+//   Slippage:              0 ticks
+//   Pyramiding:            0 orders
+//   Bar magnifier:         off
+//   Recalculate:           after order is filled = off, on every tick = off
+//   Fill orders on bar close = off (process_orders_on_close = false)
+// The strategy() arguments below set the same values, so the defaults on TradingView match.
+//@version=6
+strategy("Probe 01 MA cross", overlay = true, initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 0, pyramiding = 0)
+
+inRange = time >= timestamp("UTC", 2024, 1, 1, 0, 0) and time < timestamp("UTC", 2026, 11, 19, 0, 0)
+
+fast = ta.sma(close, 10)
+slow = ta.sma(close, 30)
+
+if inRange and ta.crossover(fast, slow)
+    strategy.entry("L", strategy.long)
+if inRange and ta.crossunder(fast, slow)
+    strategy.entry("S", strategy.short)
+
+plot(strategy.position_size, "pos")
+plot(strategy.equity, "equity")
