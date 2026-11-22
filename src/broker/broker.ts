@@ -6,6 +6,7 @@ import type {
   ClosedTrade,
   FeeConfig,
   Fill,
+  FundingEvent,
   OrderIntent,
   PairRules,
   Position,
@@ -16,6 +17,7 @@ import type {
   SubmitResult,
 } from '../core/types.js';
 import { fillPrice, floorToStep, marginRequired, roundToTick, tradeFee } from './costs.js';
+import { liquidationPrice, maintenance } from './margin.js';
 
 export interface BrokerOptions {
   startingBalance: number;
@@ -106,7 +108,7 @@ export class PaperBroker {
   /** A new bar opened: pending market orders fill at bar.open plus slippage. */
   onBarOpen(symbol: string, bar: Candle): Fill[] {
     this.lastPrice[symbol] = bar.open;
-    // TODO(Task 4): apply funding events due at this bar open.
+    // Funding is not applied here: the replay calls applyFunding explicitly for events in the bar.
     return this.fillMarketOrders(symbol, bar.open, bar.openTime);
   }
 
@@ -116,7 +118,7 @@ export class PaperBroker {
     const path = lowFirst
       ? [bar.open, bar.low, bar.high, bar.close]
       : [bar.open, bar.high, bar.low, bar.close];
-    // TODO(Task 4): check liquidation along this path before processing orders.
+    // Liquidation is not checked here: the replay calls onMark explicitly after the bar.
     const fills = this.walkPath(symbol, path, bar.openTime);
     this.lastPrice[symbol] = bar.close;
     return fills;
@@ -133,6 +135,81 @@ export class PaperBroker {
 
   markToMarket(symbol: string, price: number): void {
     this.lastPrice[symbol] = price;
+  }
+
+  /**
+   * Mark price update (binance mode only): liquidates an isolated position once the mark crosses its
+   * liquidation price. The trade closes at LP and the whole isolated margin is lost: the loss up to LP plus
+   * the maintenance remainder, which is forfeited as a clearance fee. Entry fees and funding were already
+   * charged to the balance, so the balance drops by exactly the isolated margin.
+   */
+  onMark(symbol: string, mark: number, time: number): Fill[] {
+    if (this.o.mode !== 'binance') return [];
+    const pos = this.positions[symbol];
+    const m = this.meta[symbol];
+    if (!pos || !m) return [];
+    const long = pos.qty > 0;
+    const qty = Math.abs(pos.qty);
+    const { rate, amount } = maintenance(qty * pos.entryPrice, this.o.rules(symbol).brackets);
+    const lp = liquidationPrice({
+      side: long ? 1 : -1,
+      qty,
+      entryPrice: pos.entryPrice,
+      isolatedMargin: pos.margin,
+      mmr: rate,
+      maintAmount: amount,
+    });
+    if (long ? mark > lp : mark < lp) return [];
+
+    this.balance -= pos.margin;
+    this.closed.push({
+      symbol,
+      side: long ? 'long' : 'short',
+      entryTime: pos.openTime,
+      entryPrice: pos.entryPrice,
+      exitTime: time,
+      exitPrice: lp,
+      qty,
+      pnl: -pos.margin,
+      fees: m.fees,
+      funding: m.funding,
+      exitReason: 'liquidation',
+    });
+    delete this.positions[symbol];
+    delete this.meta[symbol];
+    this.lastPrice[symbol] = mark;
+    this.purgeOrphanExits(symbol);
+    return [
+      {
+        orderId: `liquidation:${symbol}:${time}`,
+        symbol,
+        time,
+        price: lp,
+        qty,
+        side: long ? 'sell' : 'buy',
+        fee: 0,
+        liquidity: 'taker',
+      },
+    ];
+  }
+
+  /**
+   * Apply a funding payment to the open position (binance mode only). Returns the signed balance change:
+   * a long pays when the rate is positive. 0 when there is no position, the position opened at or after the
+   * event, or no mark price is known (old rows store markPrice 0, so the last price stands in).
+   */
+  applyFunding(symbol: string, ev: FundingEvent): number {
+    if (this.o.mode !== 'binance') return 0;
+    const pos = this.positions[symbol];
+    const m = this.meta[symbol];
+    if (!pos || !m || !(pos.openTime < ev.time)) return 0;
+    const mark = ev.markPrice > 0 ? ev.markPrice : this.lastPrice[symbol];
+    if (mark === undefined || !(mark > 0)) return 0;
+    const change = -pos.qty * mark * ev.rate;
+    this.balance += change;
+    this.fundingNet += change;
+    m.funding += change;
+    return change;
   }
 
   position(symbol: string): Position | null {
