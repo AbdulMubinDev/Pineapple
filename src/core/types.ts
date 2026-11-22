@@ -94,6 +94,7 @@ export interface ClosedTrade {
   exitTime: number;
   exitPrice: number;
   qty: number;
+  /** Gross realised P&L, before fees and funding. Fees and funding are in their own fields. */
   pnl: number;
   fees: number;
   funding: number;
@@ -134,4 +135,13 @@ export interface BrokerState {
   lastPrice: Record<string, number>;
   orders: StoredOrder[];
   closed: ClosedTrade[];
+  rejections: Rejection[];
+}
+
+/** An accepted order that was dropped at fill time because it no longer fit the free margin. */
+export interface Rejection {
+  orderId: string;
+  symbol: string;
+  time: number;
+  reason: 'no_free_balance';
 }

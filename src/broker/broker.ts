@@ -10,6 +10,7 @@ import type {
   PairRules,
   Position,
   PositionMeta,
+  Rejection,
   SizingRule,
   StoredOrder,
   SubmitResult,
@@ -51,6 +52,7 @@ export class PaperBroker {
   private lastPrice: Record<string, number> = {};
   private orders: StoredOrder[] = [];
   private closed: ClosedTrade[] = [];
+  private rejected: Rejection[] = [];
 
   constructor(o: BrokerOptions) {
     this.o = o;
@@ -64,21 +66,27 @@ export class PaperBroker {
     const rules = this.o.rules(i.symbol);
     const binance = this.o.mode === 'binance';
 
+    const reduce = this.isReduce(i);
+    const pos = this.positions[i.symbol];
     let qty = i.qty;
     if (this.o.sizing.kind === 'fixed' && i.tag === 'entry' && !i.reduceOnly) {
-      qty = this.o.sizing.notionalUsd / ref;
+      // Fixed sizing sizes only the opening part; an opposing order also has to close the old position.
+      const opposes = pos !== undefined && (pos.qty > 0) !== (i.side === 'buy');
+      qty = this.o.sizing.notionalUsd / ref + (opposes ? Math.abs(pos.qty) : 0);
     }
     if (binance) qty = floorToStep(qty, rules.stepSize);
     if (!(qty > 0)) return { accepted: false, reason: 'zero_qty_after_rounding' };
-    if (binance && qty * ref < rules.minNotional) return { accepted: false, reason: 'below_min_notional' };
+    // Reduce-only orders skip min notional so a dust remainder can always be closed.
+    if (binance && !reduce && qty * ref < rules.minNotional) return { accepted: false, reason: 'below_min_notional' };
 
-    if (!i.reduceOnly && i.tag !== 'exit') {
-      const pos = this.positions[i.symbol];
-      const opposes = pos !== undefined && (pos.qty > 0) !== (i.side === 'buy');
-      const openQty = opposes ? Math.max(0, qty - Math.abs(pos.qty)) : qty;
+    if (!reduce) {
+      const openQty = this.openingQty(i, qty);
       if (openQty > 0) {
-        const need = marginRequired(openQty, ref, i.leverage) + tradeFee(openQty, ref, this.o.fees.takerRate);
-        if (need > this.account().freeMargin) return { accepted: false, reason: 'no_free_balance' };
+        const need = this.marginAndFee(openQty, ref, i.leverage);
+        // Pending opening orders already spoken for part of the free margin.
+        if (need > this.account().freeMargin - this.reservedMargin(i.id)) {
+          return { accepted: false, reason: 'no_free_balance' };
+        }
       }
     }
 
@@ -151,6 +159,11 @@ export class PaperBroker {
     return this.closed.map((t) => ({ ...t }));
   }
 
+  /** Opening orders dropped at fill time because they no longer fit the free margin. */
+  rejections(): Rejection[] {
+    return this.rejected.map((r) => ({ ...r }));
+  }
+
   openOrders(symbol?: string): OrderIntent[] {
     return this.orders
       .filter((x) => symbol === undefined || x.symbol === symbol)
@@ -174,6 +187,7 @@ export class PaperBroker {
       lastPrice: this.lastPrice,
       orders: this.orders,
       closed: this.closed,
+      rejections: this.rejected,
     });
   }
 
@@ -189,10 +203,45 @@ export class PaperBroker {
     b.lastPrice = c.lastPrice;
     b.orders = c.orders;
     b.closed = c.closed;
+    b.rejected = c.rejections ?? [];
     return b;
   }
 
   // ---------------------------------------------------------------- internals
+
+  private isReduce(o: { reduceOnly: boolean; tag: 'entry' | 'exit' }): boolean {
+    return o.reduceOnly || o.tag === 'exit';
+  }
+
+  /** The part of an order that opens (or adds to) a position rather than closing one. */
+  private openingQty(o: { symbol: string; side: 'buy' | 'sell' }, qty: number): number {
+    const pos = this.positions[o.symbol];
+    const opposes = pos !== undefined && (pos.qty > 0) !== (o.side === 'buy');
+    return opposes ? Math.max(0, qty - Math.abs(pos.qty)) : qty;
+  }
+
+  private marginAndFee(qty: number, price: number, leverage: number): number {
+    return marginRequired(qty, price, leverage) + tradeFee(qty, price, this.o.fees.takerRate);
+  }
+
+  /** Margin + entry fee that pending opening orders (other than `excludeId`) will need. */
+  private reservedMargin(excludeId: string): number {
+    let sum = 0;
+    for (const x of this.orders) {
+      if (x.id === excludeId || this.isReduce(x)) continue;
+      const price = this.lastPrice[x.symbol];
+      if (price === undefined) continue;
+      sum += this.marginAndFee(this.openingQty(x, x.qty), price, x.leverage);
+    }
+    return sum;
+  }
+
+  /** A reduce-only/exit order can only act while there is an opposing position to reduce. */
+  private canAct(o: StoredOrder): boolean {
+    if (!this.isReduce(o)) return true;
+    const pos = this.positions[o.symbol];
+    return pos !== undefined && (pos.qty > 0) !== (o.side === 'buy');
+  }
 
   private fillMarketOrders(symbol: string, price: number, time: number): Fill[] {
     const fills: Fill[] = [];
@@ -240,6 +289,7 @@ export class PaperBroker {
         let best: { ord: StoredOrder; t: Trigger } | null = null;
         for (const ord of this.orders) {
           if (ord.symbol !== symbol || ord.type === 'market') continue;
+          if (!this.canAct(ord)) continue; // exit with nothing to exit stays resting
           if (ord.ocaGroup !== undefined && filledGroups.has(ord.ocaGroup)) continue;
           const t = this.trigger(ord, cursor, target);
           if (t && (best === null || t.dist < best.t.dist)) best = { ord, t };
@@ -262,13 +312,15 @@ export class PaperBroker {
 
   /** Fill an order at a reference price. Returns null if it was dropped (nothing to reduce). */
   private execute(ord: StoredOrder, refPrice: number, time: number): Fill | null {
+    if (!this.canAct(ord)) {
+      // A market exit has nothing to do now; resting stops/limits are kept (walkPath never offers them).
+      if (ord.type === 'market') this.orders = this.orders.filter((x) => x !== ord);
+      return null;
+    }
     this.orders = this.orders.filter((x) => x !== ord);
     const pos = this.positions[ord.symbol];
     let qty = ord.qty;
-    if (ord.reduceOnly || ord.tag === 'exit') {
-      if (!pos || (pos.qty > 0) === (ord.side === 'buy')) return null;
-      qty = Math.min(qty, Math.abs(pos.qty));
-    }
+    if (this.isReduce(ord) && pos) qty = Math.min(qty, Math.abs(pos.qty));
 
     const maker = ord.type === 'limit' || (ord.type === 'stop_limit' && ord.triggered === true);
     let price = refPrice;
@@ -276,6 +328,18 @@ export class PaperBroker {
       price = fillPrice(refPrice, ord.side, this.o.fees.slippagePct);
       if (this.o.mode === 'binance') {
         price = roundToTick(price, this.o.rules(ord.symbol).tickSize, ord.side === 'buy' ? 'up' : 'down');
+      }
+    }
+    if (!this.isReduce(ord)) {
+      // Re-check against the actual fill price; closing an opposing position frees its margin.
+      const openQty = this.openingQty(ord, qty);
+      if (openQty > 0) {
+        const released = pos && openQty < qty ? (pos.margin * Math.min(qty, Math.abs(pos.qty))) / Math.abs(pos.qty) : 0;
+        const need = marginRequired(openQty, price, ord.leverage) + tradeFee(openQty, price, this.o.fees.takerRate);
+        if (need > this.account().freeMargin + released) {
+          this.rejected.push({ orderId: ord.id, symbol: ord.symbol, time, reason: 'no_free_balance' });
+          return null;
+        }
       }
     }
     const fee = tradeFee(qty, price, maker ? this.o.fees.makerRate : this.o.fees.takerRate);

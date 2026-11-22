@@ -2,7 +2,7 @@ import type { FeeConfig } from '../core/types.js';
 
 export const DEFAULT_FEES: FeeConfig = { makerRate: 0.0002, takerRate: 0.0005, slippagePct: 0.0002 };
 
-/** Relative tolerance so 500100.00000000006 ticks counts as 500100. */
+/** Absolute tolerance, in ticks/steps, so 500100.00000000006 ticks counts as 500100. */
 const EPS = 1e-9;
 
 function decimalsOf(x: number): number {
