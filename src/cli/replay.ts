@@ -12,7 +12,7 @@ import { isTimeframe } from '../core/timeframe.js';
 import type { BrokerMode, FundingEvent, PairRules, SizingRule } from '../core/types.js';
 import { loadCandles, loadFunding } from '../data/csv.js';
 import { replay, type TvProperties } from '../engine/replay.js';
-import { tradeNet, tradesCsv } from '../report/summary.js';
+import { formatPrice, tradeNet, tradesCsv } from '../report/summary.js';
 
 const DAY_MS = 86_400_000;
 
@@ -115,7 +115,7 @@ async function main(): Promise<void> {
   for (const [k, v] of rows) console.log(`  ${k.padEnd(w)}  ${v}`);
   if (r.openPosition) {
     const p = r.openPosition;
-    console.log(`  ${'Open position at end'.padEnd(w)}  ${p.qty > 0 ? 'long' : 'short'} ${Math.abs(p.qty).toFixed(8)} @ ${p.entryPrice} since ${iso(p.openTime)}`);
+    console.log(`  ${'Open position at end'.padEnd(w)}  ${p.qty > 0 ? 'long' : 'short'} ${Math.abs(p.qty).toFixed(8)} @ ${formatPrice(p.entryPrice)} since ${iso(p.openTime)}`);
   }
 
   console.log(`\nAnomalies: ${r.anomalies.length}`);
@@ -123,7 +123,13 @@ async function main(): Promise<void> {
   console.log(`Rejections: ${r.rejections.length}`);
   for (const x of r.rejections) console.log(`  ${iso(x.time)}  ${x.stage}  ${x.reason}  ${x.orderId}`);
   console.log(`Overfill round trips (not in the summary or CSV): ${r.overfills.length}`);
-  for (const t of r.overfills) console.log(`  ${iso(t.entryTime)} -> ${iso(t.exitTime)}  ${t.side} ${t.qty.toFixed(8)}  net ${usd(tradeNet(t))} USD`);
+  for (const t of r.overfills) {
+    console.log(`  ${iso(t.entryTime)} -> ${iso(t.exitTime)}  ${t.side} ${t.qty.toFixed(8)} @ ${formatPrice(t.entryPrice)} -> ${formatPrice(t.exitPrice)}  net ${usd(tradeNet(t))} USD`);
+  }
+  if (r.overfills.length > 0) {
+    const sum = r.overfills.reduce((s, t) => s + tradeNet(t), 0);
+    console.log(`  Note: Final equity and the equity curve (so max drawdown too) include the overfill P&L (${usd(sum)} USD); net profit excludes it.`);
+  }
 
   mkdirSync(values.out, { recursive: true });
   const csvPath = join(values.out, `${basename(values.script, extname(values.script))}-trades.csv`);

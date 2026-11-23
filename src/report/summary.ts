@@ -61,8 +61,12 @@ export function summarize(trades: ClosedTrade[], startingBalance: number, equity
 const usd = (n: number) => n.toFixed(2);
 const qty = (n: number) => n.toFixed(8);
 const iso = (t: number) => new Date(t).toISOString();
-// Prices to 8 dp without trailing zeros (an averaged entry price can carry float noise).
-const price = (n: number) => String(Number(n.toFixed(8)));
+/** A price to 8 dp without trailing zeros, never in exponent notation (an averaged entry can carry float noise). */
+export function formatPrice(n: number): string {
+  const s = n.toFixed(8);
+  return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s;
+}
+const price = formatPrice;
 
 export const TRADES_CSV_HEADER = 'symbol,side,entryTime,entryPrice,exitTime,exitPrice,qty,pnl,fees,funding,net,exitReason';
 

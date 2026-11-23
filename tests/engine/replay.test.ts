@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { Candle, FundingEvent, PairRules } from '../../src/core/types.js';
 import { DataGapError, loadCandles } from '../../src/data/csv.js';
-import { replay } from '../../src/engine/replay.js';
+import { replay, splitOverfills } from '../../src/engine/replay.js';
 import { tradesCsv } from '../../src/report/summary.js';
 
 const H4 = 14_400_000;
@@ -60,6 +60,13 @@ describe('replay on the fixture (probe 01)', () => {
     await expect(replay({ ...base, source: probe01, candles: gapped, from: FROM, to: TO, mode: 'tradingview', tv: TV })).rejects.toBeInstanceOf(DataGapError);
   });
 
+  it('a gap after `to` does not matter', async () => {
+    const gapped = [...fixture, ...fixture.slice(-1).map((c) => ({ ...c, openTime: c.openTime + 5 * H4 }))];
+    const to = fixture.at(-1)!.openTime;
+    const r = await replay({ ...base, source: probe01, candles: gapped, from: FROM, to, mode: 'tradingview', tv: TV });
+    expect(r.equityCurve.at(-1)!.time).toBe(to);
+  });
+
   it('rejects a script that does not compile', async () => {
     await expect(replay({ ...base, source: '//@version=6\nindicator("x")\nplot(close)\n', candles: fixture, from: FROM, to: TO, mode: 'tradingview', tv: TV })).rejects.toThrow(/strategy\(\) scripts only/);
   });
@@ -94,14 +101,40 @@ describe('replay wiring (synthetic bars)', () => {
     const r = await replay({ ...base, source: src, candles, from: T0, to: candles.at(-1)!.openTime, mode: 'tradingview', tv: NOFEE });
     expect(r.anomalies.map((a) => a.kind)).toEqual(['pyramiding_overfill']);
     expect(r.overfills).toHaveLength(1);
-    expect(r.overfills[0]).toMatchObject({ entryTime: candles[41]!.openTime, exitTime: candles[42]!.openTime, qty: 1, exitPrice: 104 });
-    // The broker averages the two lots: entry 101.5, so the overfill books (104 - 101.5).
-    expect(r.overfills[0]!.pnl).toBeCloseTo(2.5, 10);
+    // The broker averages the two lots (101.5); the replay restates each side at its own lot's price.
+    expect(r.overfills[0]).toMatchObject({ entryTime: candles[41]!.openTime, exitTime: candles[42]!.openTime, qty: 1, entryPrice: 102, exitPrice: 104 });
+    expect(r.overfills[0]!.pnl).toBeCloseTo(2, 10);
     expect(r.trades).toHaveLength(1);
-    expect(r.trades[0]).toMatchObject({ exitTime: candles[46]!.openTime, qty: 1 });
+    expect(r.trades[0]).toMatchObject({ exitTime: candles[46]!.openTime, qty: 1, entryPrice: 101, exitPrice: 104 });
     expect(r.summary.tradeCount).toBe(1);
-    expect(r.summary.netProfit).toBeCloseTo(2.5, 10);
+    expect(r.summary.netProfit).toBeCloseTo(3, 10); // TradingView: 104 - 101
+    // Script + overfill = the broker's total.
+    expect(r.summary.netProfit + r.overfills[0]!.pnl).toBeCloseTo(r.account.balance - 10_000, 10);
     expect(tradesCsv(r.trades).trim().split('\n')).toHaveLength(2);
+  });
+
+  it('splitOverfills: a script close that absorbed overfill quantity is split, fees and funding by quantity', () => {
+    const t = {
+      symbol: 'BTCUSDT',
+      side: 'long' as const,
+      entryTime: 1,
+      entryPrice: 101.5,
+      exitTime: 9,
+      exitPrice: 104,
+      qty: 2,
+      pnl: 5,
+      fees: 0.4,
+      funding: -0.2,
+      exitReason: 'signal' as const,
+      exitOrderId: 'BTCUSDT|CA|3',
+    };
+    const plain = { ...t, exitOrderId: 'other', exitTime: 20 };
+    const { trades, overfills } = splitOverfills(
+      [t, plain],
+      [{ orderId: 'BTCUSDT|CA|3', time: 9, parts: [{ kind: 'script', qty: 1, entryPrice: 101, pnl: 3 }, { kind: 'overfill', qty: 1, entryPrice: 102, pnl: 2 }] }],
+    );
+    expect(trades).toEqual([{ ...t, qty: 1, entryPrice: 101, pnl: 3, fees: 0.2, funding: -0.1 }, plain]);
+    expect(overfills).toEqual([{ ...t, qty: 1, entryPrice: 102, pnl: 2, fees: 0.2, funding: -0.1 }]);
   });
 
   it('lists rejections from submit and from fill time', async () => {

@@ -37,7 +37,7 @@ import type {
 import { DataGapError } from '../data/csv.js';
 import { summarize, type Summary } from '../report/summary.js';
 import { compileScript, runStrategy, type BarHooks, type PineOrderCall, type StrategyDeclaration } from './pine-runner.js';
-import { StrategyLayer, type LayerAnomaly, type ScriptView } from './strategy-layer.js';
+import { StrategyLayer, type LayerAnomaly, type ScriptView, type TradeAttribution } from './strategy-layer.js';
 
 /** TradingView's Strategy Properties: commission in percent, slippage in ticks. */
 export interface TvProperties {
@@ -157,6 +157,31 @@ export function barHooks(o: BarHooksOptions): BarHooks {
   };
 }
 
+/**
+ * Restates the broker's closed trades by the layer's attributions: a closing fill that mixed an overfill
+ * lot's price into the averaged entry becomes a script trade at the script's own entry and/or an
+ * overfill round trip at the overfill lot's price. Fees and funding split by quantity. The parts of a
+ * trade add up to the broker's figures over a whole position, so script + overfill = broker total.
+ */
+export function splitOverfills(closed: ClosedTrade[], attributions: TradeAttribution[]): { trades: ClosedTrade[]; overfills: ClosedTrade[] } {
+  const byFill = new Map(attributions.map((a) => [`${a.orderId}@${a.time}`, a]));
+  const trades: ClosedTrade[] = [];
+  const overfills: ClosedTrade[] = [];
+  for (const t of closed) {
+    const a = t.exitOrderId !== undefined ? byFill.get(`${t.exitOrderId}@${t.exitTime}`) : undefined;
+    if (!a) {
+      trades.push(t);
+      continue;
+    }
+    for (const p of a.parts) {
+      const share = p.qty / t.qty;
+      const part: ClosedTrade = { ...t, qty: p.qty, entryPrice: p.entryPrice, pnl: p.pnl, fees: t.fees * share, funding: t.funding * share };
+      (p.kind === 'script' ? trades : overfills).push(part);
+    }
+  }
+  return { trades, overfills };
+}
+
 function assertContiguous(candles: Candle[], tf: Timeframe): void {
   const step = tfToMs(tf);
   for (let i = 1; i < candles.length; i++) {
@@ -166,8 +191,9 @@ function assertContiguous(candles: Candle[], tf: Timeframe): void {
 }
 
 export async function replay(o: ReplayOptions): Promise<ReplayResult> {
-  assertContiguous(o.candles, o.tf);
+  // Only what is replayed (warm-up included) has to be contiguous: a gap after `to` does not matter.
   const candles = o.candles.filter((c) => c.openTime <= o.to);
+  assertContiguous(candles, o.tf);
   if (!candles.some((c) => c.openTime >= o.from)) throw new Error('replay: no candles between from and to');
 
   const compiled = await compileScript(o.source);
@@ -216,9 +242,10 @@ export async function replay(o: ReplayOptions): Promise<ReplayResult> {
     hooks,
   });
 
-  const closed = broker.closedTrades().filter((t) => t.symbol === o.symbol);
-  const isOverfill = (t: ClosedTrade) => t.exitOrderId !== undefined && StrategyLayer.isOverfillClose(o.symbol, t.exitOrderId);
-  const trades = closed.filter((t) => !isOverfill(t));
+  const { trades, overfills } = splitOverfills(
+    broker.closedTrades().filter((t) => t.symbol === o.symbol),
+    layer.attributions(),
+  );
   const rejections = [
     ...submitRejections,
     ...broker.rejections().map((r): ReplayRejection => ({ stage: 'fill', orderId: r.orderId, time: r.time, reason: r.reason })),
@@ -228,7 +255,7 @@ export async function replay(o: ReplayOptions): Promise<ReplayResult> {
     trades,
     equityCurve,
     summary: summarize(trades, startingBalance, equityCurve),
-    overfills: closed.filter(isOverfill),
+    overfills,
     anomalies: layer.anomalies(),
     rejections,
     openPosition: broker.position(o.symbol),

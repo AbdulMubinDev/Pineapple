@@ -116,7 +116,7 @@ export class PaperBroker {
    * Trigger resting stop/limit orders along the bar path (TradingView's intrabar assumption).
    * With `liquidation` (binance mode only), the isolated position's liquidation price is checked on the
    * same path, in order with the orders: whichever the path reaches first acts first, and a tie goes to
-   * the order. The bar's prices stand in for the mark price, which the candles do not carry.
+   * the order. On a gap past both, the order acts first only if its level lies between the previous price and LP. The bar's prices stand in for the mark price, which the candles do not carry.
    */
   onBarRange(symbol: string, bar: Candle, opts: { liquidation?: boolean } = {}): Fill[] {
     const lowFirst = Math.abs(bar.high - bar.open) >= Math.abs(bar.open - bar.low);
@@ -310,6 +310,17 @@ export class PaperBroker {
     return { orderId, symbol, time, price: lp, qty, side: long ? 'sell' : 'buy', fee: 0, liquidity: 'taker' };
   }
 
+  /**
+   * A gap past both an order's level and the liquidation price (both at distance 0): the order acts first
+   * only if its level lies between the previous price and LP (a long's stop at or above LP, a short's at or
+   * below), so the move reached it first.
+   */
+  private beforeLiquidation(o: StoredOrder, lp: number, symbol: string): boolean {
+    const level = o.type === 'limit' || (o.type === 'stop_limit' && o.triggered) ? o.limitPrice : o.stopPrice;
+    if (level === undefined) return true;
+    return (this.positions[symbol] as Position).qty > 0 ? level >= lp : level <= lp;
+  }
+
   /** Where the open position's liquidation price is reached while price moves cursor -> target, or null. */
   private liquidationTrigger(symbol: string, cursor: number, target: number): { lp: number; t: Trigger } | null {
     const lp = this.liquidationLevel(symbol);
@@ -410,7 +421,7 @@ export class PaperBroker {
           if (t && (best === null || t.dist < best.t.dist)) best = { ord, t };
         }
         const liq = liquidation ? this.liquidationTrigger(symbol, cursor, target) : null;
-        if (liq && (best === null || liq.t.dist < best.t.dist)) {
+        if (liq && (best === null || liq.t.dist < best.t.dist || (liq.t.dist === 0 && best.t.dist === 0 && !this.beforeLiquidation(best.ord, liq.lp, symbol)))) {
           fills.push(this.liquidate(symbol, liq.lp, time));
           cursor = liq.t.price;
           continue;

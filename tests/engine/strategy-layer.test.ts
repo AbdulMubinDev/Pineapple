@@ -364,6 +364,49 @@ describe('StrategyLayer', () => {
     expect(r.before(flatBar(3, 48_500))).toMatchObject({ positionSize: 2, openTrades: 2 });
   });
 
+  it('overfill round trip: closing fills are restated at each lot\'s own price', () => {
+    const r = rig({ d: { pyramiding: 2 } });
+    r.after(flatBar(0), [entry('A', 'long', { qty: 1 })]);
+    r.before(flatBar(1)); // A @ 50000
+    r.after(flatBar(1), [entry('B', 'long', { qty: 1, limit: 49_000 }), entry('C', 'long', { qty: 1, limit: 48_000 })]);
+    r.before(bar(2, 50_000, 50_000, 47_500, 48_500)); // B @ 49000, C @ 48000 (overfill)
+    r.after(bar(2, 50_000, 50_000, 47_500, 48_500), [{ kind: 'close_all', id: '' }]);
+    r.before(flatBar(3, 51_000)); // the overfill close, then close_all, both at 51000
+    const [of, all] = r.layer.attributions();
+    expect(of!.parts).toEqual([{ kind: 'overfill', qty: 1, entryPrice: 48_000, pnl: 3_000 }]);
+    expect(all!.parts).toEqual([{ kind: 'script', qty: 2, entryPrice: 49_500, pnl: 3_000 }]);
+    // Broker: avg 49000 for all three, 3 x 2000 = 6000 = 3000 + 3000.
+    expect(r.broker.closedTrades().reduce((s, t) => s + t.pnl, 0)).toBeCloseTo(6_000, 8);
+    expect(r.layer.anomalies().map((a) => a.kind)).toEqual(['pyramiding_overfill']);
+  });
+
+  it('a script close that takes the overfill quantity first is split and logged as overfill_absorbed', () => {
+    const r = rig({ d: { pyramiding: 2 } });
+    r.after(flatBar(0), [entry('A', 'long', { qty: 1 })]);
+    r.before(flatBar(1));
+    r.after(flatBar(1), [entry('B', 'long', { qty: 1, limit: 49_000 }), entry('C', 'long', { qty: 1, limit: 48_000 })]);
+    r.ctl.reject = (i) => i.id.includes('|OF|'); // the overfill close never reaches the broker
+    r.before(bar(2, 50_000, 50_000, 47_500, 48_500));
+    r.after(bar(2, 50_000, 50_000, 47_500, 48_500), [{ kind: 'close_all', id: '' }]);
+    r.before(flatBar(3, 51_000));
+    expect(r.broker.position(SYM)).toBeNull();
+    const [all] = r.layer.attributions();
+    expect(all!.parts).toEqual([
+      { kind: 'script', qty: 2, entryPrice: 49_500, pnl: 3_000 },
+      { kind: 'overfill', qty: 1, entryPrice: 48_000, pnl: 3_000 },
+    ]);
+    expect(r.layer.anomalies().map((a) => a.kind)).toEqual(['pyramiding_overfill', 'overfill_absorbed']);
+  });
+
+  it('no overfill, no attributions', () => {
+    const r = rig();
+    r.after(flatBar(0), [entry('A', 'long', { qty: 1 })]);
+    r.before(flatBar(1));
+    r.after(flatBar(1), [{ kind: 'close_all', id: '' }]);
+    r.before(flatBar(2, 51_000));
+    expect(r.layer.attributions()).toEqual([]);
+  });
+
   it('FIFO close("B") pairs with A in opentrades but takes B\'s own lot: a second close("B") does nothing', () => {
     // TradingView's two books (PineTS 0.13.1 openTradeList / closeMatching, and the emulator-parity test
     // in pine-runner.test.ts): the script sees B open, while B's own quantity is gone.

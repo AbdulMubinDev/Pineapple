@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ClosedTrade } from '../../src/core/types.js';
-import { summarize, tradeNet, tradesCsv } from '../../src/report/summary.js';
+import { formatPrice, summarize, tradeNet, tradesCsv } from '../../src/report/summary.js';
 
 const trade = (pnl: number, more: Partial<ClosedTrade> = {}): ClosedTrade => ({
   symbol: 'BTCUSDT',
@@ -65,6 +65,22 @@ describe('summarize', () => {
   it('a drawdown from the starting balance counts even before a new high', () => {
     const curve = [9_000, 9_500].map((equity, i) => ({ time: i, equity }));
     expect(summarize([], 10_000, curve).maxDrawdownPct).toBeCloseTo(10, 12);
+  });
+});
+
+describe('formatPrice', () => {
+  it('8 dp, trailing zeros trimmed, no exponent notation', () => {
+    expect(formatPrice(40_000)).toBe('40000');
+    expect(formatPrice(101.50000000001)).toBe('101.5');
+    expect(formatPrice(0.00000123)).toBe('0.00000123');
+    expect(formatPrice(1.5e-7)).toBe('0.00000015');
+    expect(formatPrice(0)).toBe('0');
+  });
+
+  it('the CSV writes tiny prices the same way', () => {
+    const row = tradesCsv([trade(1, { entryPrice: 1.5e-7, exitPrice: 2e-7 })]).split('\n')[1]!;
+    expect(row.split(',')[3]).toBe('0.00000015');
+    expect(row.split(',')[5]).toBe('0.0000002');
   });
 });
 

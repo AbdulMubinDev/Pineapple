@@ -76,6 +76,26 @@ describe('onBarRange with the liquidation check (binance mode)', () => {
     expect(fills.map((f) => f.orderId)).toEqual(['sl']);
   });
 
+  it('a gap past both: a long whose stop is below the liquidation price liquidates', () => {
+    const b = long10x(); // LP 45189.76
+    b.submit(order({ id: 'sl', side: 'sell', type: 'stop', stopPrice: 44000, tag: 'exit', reduceOnly: true }), 0);
+    const fills = b.onBarRange('BTCUSDT', bar(40000, 40100, 39000, 39500, 5000), { liquidation: true });
+    expect(fills.map((f) => f.orderId)).toEqual(['liquidation:BTCUSDT:5000']);
+  });
+
+  it('a gap past both, short side: a stop at or below LP fills first, one above it liquidates', () => {
+    // Short 0.1 @ 49990 (10x): LP 54769.92.
+    const short = (stop: number) => {
+      const b = make();
+      b.submit(order({ side: 'sell' }), 0);
+      b.onBarOpen('BTCUSDT', bar(50000, 50000, 50000, 50000));
+      b.submit(order({ id: 'sl', side: 'buy', type: 'stop', stopPrice: stop, tag: 'exit', reduceOnly: true }), 0);
+      return b.onBarRange('BTCUSDT', bar(60000, 60100, 59000, 59500, 5000), { liquidation: true }).map((f) => f.orderId);
+    };
+    expect(short(54000)).toEqual(['sl']);
+    expect(short(56000)).toEqual(['liquidation:BTCUSDT:5000']);
+  });
+
   it('checks a position opened earlier on the same path', () => {
     const b = make();
     b.submit(order({ id: 'in', type: 'stop', stopPrice: 50500 }), 0);

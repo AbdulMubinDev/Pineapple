@@ -72,9 +72,24 @@ interface Lot {
 
 /** Something the layer had to correct after the broker acted; the replay should log these. */
 export interface LayerAnomaly {
-  kind: 'pyramiding_overfill' | 'exit_leg_resent';
+  kind: 'pyramiding_overfill' | 'exit_leg_resent' | 'overfill_absorbed';
   orderId: string;
   time: number;
+}
+
+export interface AttributionPart {
+  kind: 'script' | 'overfill';
+  qty: number;
+  entryPrice: number;
+  /** Gross P&L of this part, at its own entry price. */
+  pnl: number;
+}
+
+/** One closing fill (the broker closed trade with this exitOrderId and exitTime), restated in parts. */
+export interface TradeAttribution {
+  orderId: string;
+  time: number;
+  parts: AttributionPart[];
 }
 
 const OVERFILL = '\u0000overfill';
@@ -135,6 +150,11 @@ export class StrategyLayer {
   /** strategy.entry adds taken off the broker while the pyramiding cap is full (they go back once there is room). */
   private readonly parked = new Map<string, OrderIntent>();
   private readonly anomalyLog: LayerAnomaly[] = [];
+  private readonly attributionLog: TradeAttribution[] = [];
+  /** The broker's averaged entry over the script's own fills (overfill lots left out). */
+  private scriptAvg = 0;
+  /** An overfill lot has been part of the current broker position. */
+  private tainted = false;
   private seq = 0;
 
   constructor(
@@ -153,9 +173,9 @@ export class StrategyLayer {
     return this.anomalyLog.map((a) => ({ ...a }));
   }
 
-  /** The market close that takes a pyramiding overfill lot out (its round trip is not a script trade). */
-  static isOverfillClose(symbol: string, orderId: string): boolean {
-    return orderId.startsWith(`${symbol}|OF|`);
+  /** How closing fills split between script trades and overfill lots (see attribute()); empty without overfills. */
+  attributions(): TradeAttribution[] {
+    return this.attributionLog.map((a) => ({ ...a, parts: a.parts.map((p) => ({ ...p })) }));
   }
 
   /** A flat view (warm-up, validation): no position, the given equity. */
@@ -210,6 +230,8 @@ export class StrategyLayer {
       if (f.orderId.startsWith('liquidation:')) {
         this.lots = [];
         this.records = [];
+        this.scriptAvg = 0;
+        this.tainted = false;
         continue;
       }
       const m = this.meta.get(f.orderId);
@@ -519,7 +541,8 @@ export class StrategyLayer {
       const closing = Math.min(qty, Math.abs(net));
       const named = m?.kind === 'overfill' ? OVERFILL : m && (m.kind === 'exit' || m.kind === 'close') ? m.entryId : undefined;
       const fromOverfill = this.closeLots(closing, named);
-      this.closeRecords(closing - fromOverfill, named);
+      this.closeRecords(closing - fromOverfill.qty, named);
+      this.attribute(f, m, closing, fromOverfill, -dir as Dir);
       qty -= closing;
     }
     if (qty <= EPS) return;
@@ -528,6 +551,7 @@ export class StrategyLayer {
       // adds filling inside one broker call). TradingView would have cancelled it: it is not a script
       // trade, and a market close takes it out at the next price event. Logged as an anomaly.
       this.lots.push({ entryId: OVERFILL, qty, dir, price: f.price, exitsFilled: new Set(), overfill: true });
+      this.tainted = true;
       const id = `${this.symbol}|OF|${this.seq++}`;
       this.meta.set(id, { kind: 'overfill' });
       out.set(id, this.closeIntent(id, dir, qty));
@@ -535,27 +559,59 @@ export class StrategyLayer {
       return;
     }
     const entryId = m?.entryId ?? f.orderId;
+    const held = this.scriptQty();
+    this.scriptAvg = (held * this.scriptAvg + qty * f.price) / (held + qty);
     this.lots.push({ entryId, qty, dir, price: f.price, exitsFilled: new Set() });
     this.records.push({ entryId, qty, dir, price: f.price, barIndex: idx, time: f.time });
   }
 
   /**
    * Physical lots: a close / exit for an entry takes that entry's lots first, oldest first. Returns
-   * the part taken from overfill lots (not script trades).
+   * the part taken from overfill lots (not script trades), with its cost at those lots' fill prices.
    */
-  private closeLots(qty: number, entryId?: string): number {
+  private closeLots(qty: number, entryId?: string): { qty: number; cost: number } {
     const order = entryId ? [...this.lots.filter((l) => l.entryId === entryId), ...this.lots.filter((l) => l.entryId !== entryId)] : this.lots;
     let need = qty;
-    let fromOverfill = 0;
+    const fromOverfill = { qty: 0, cost: 0 };
     for (const l of order) {
       if (need <= EPS) break;
       const take = Math.min(l.qty, need);
       l.qty -= take;
       need -= take;
-      if (l.overfill) fromOverfill += take;
+      if (l.overfill) {
+        fromOverfill.qty += take;
+        fromOverfill.cost += take * l.price;
+      }
     }
     this.lots = this.lots.filter((l) => l.qty > EPS);
     return fromOverfill;
+  }
+
+  /**
+   * The broker keeps one averaged entry per position, so once an overfill lot has been in it, the
+   * broker's P&L for each closing fill mixes the overfill's price into the script's. While that is so,
+   * every closing fill is restated in parts: the script's share at the script's own average entry
+   * (the broker's averaging rule over the script fills only) and the overfill share at its lots' prices.
+   * Over a whole position the parts add up to the broker's P&L.
+   */
+  private attribute(f: Fill, m: OrderMeta | undefined, closing: number, fromOverfill: { qty: number; cost: number }, posDir: Dir): void {
+    const scriptPart = closing - fromOverfill.qty;
+    if (this.tainted) {
+      const parts: AttributionPart[] = [];
+      if (scriptPart > EPS) parts.push({ kind: 'script', qty: scriptPart, entryPrice: this.scriptAvg, pnl: posDir * (f.price - this.scriptAvg) * scriptPart });
+      if (fromOverfill.qty > EPS) {
+        parts.push({ kind: 'overfill', qty: fromOverfill.qty, entryPrice: fromOverfill.cost / fromOverfill.qty, pnl: posDir * (f.price * fromOverfill.qty - fromOverfill.cost) });
+        // The script's own close took overfill quantity before the overfill close could (it never fills).
+        if (m?.kind !== 'overfill') this.anomalyLog.push({ kind: 'overfill_absorbed', orderId: f.orderId, time: f.time });
+      }
+      this.attributionLog.push({ orderId: f.orderId, time: f.time, parts });
+    }
+    if (this.scriptQty() <= EPS) this.scriptAvg = 0;
+    if (Math.abs(this.netSize()) <= EPS) this.tainted = false;
+  }
+
+  private scriptQty(): number {
+    return this.tradeLots().reduce((s, l) => s + l.qty, 0);
   }
 
   /** The script's open trades: FIFO pairs any exit with the oldest trades; ANY with the named entry's. */
