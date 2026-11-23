@@ -355,7 +355,157 @@ Wrapping PineTS's own emulator as our broker is not recommended. It is good (Kyb
 trade of TV), but it is not ours to control, and the design wants one broker for backtest, replay
 and live.
 
+## Resident instances with bounded history (Task 2b)
+
+The question: can about 2,500 KyberSwing-sized instances (5 runs × ~500 pairs) stay resident and
+be stepped once per bar, inside a 768 MB / 1 CPU container, with a pass finishing within ~10 s?
+The two options from Task 2 failed. Rebuilding every pass takes ~14 min; keeping instances
+resident needs ~25 GB.
+
+Code: `spike/resident.ts` (pure; also bundled into the isolate), `spike/hook-core.ts` (the order
+recorder and arg normaliser, shared with `probe.ts`). Tests: `tests/spike/resident.test.ts`.
+Benches: `spike/resident-bench.ts` (Node), `spike/resident-isolate.ts` (isolated-vm) and
+`spike/docker-resident.sh` (the Linux run).
+
+### 2b.1 Trimming: yes, by trimming PineTS internals between bars
+
+No PineTS option exists for this. A resident instance runs three mechanisms.
+
+**1. Stepping without rebuilding the daily context.** Each new bar bumps `$.dataVersion`, so
+PineTS's own `updateTail()` refreshes every cached `request.security` context incrementally from
+our provider. Its rollback bug (Q5) is fixed by `installUpdateTailFix()`. It wraps
+`PineTS.prototype._snapshotVarState` / `_restoreVarState` so the plain arrays under `params` are
+snapshotted and restored as well. The fix applies only to PineTS instances fed by our
+`StoreProvider`.
+
+**2. Trimming after every step** (`ResidentInstance.trim`):
+- **Series and `params` buffers** (`$.const/var/let/params`, `$.lctx`, `$.data.*`) are cut to `keep` once they exceed `keep + slack`.
+  - The cut is done in place (same array object), and the backing store is re-allocated.
+  - `splice` would keep the old capacity.
+  - This is safe because PineTS reads all of them relative to their end (`Series.get`, `$.param`).
+- **The daily context uses one uniform cut.** `request.security` reads `params[expr][i]`, with `i` taken from `data.openTime.data`, so every buffer drops the same count. The stored rollback snapshot `_varSnapshot` is shifted by what each buffer lost.
+- **The chart arrays** of the main and daily PineTS instances (`data/open/.../closeTime`, `marketData`) are absolutely indexed by bar number. They are replaced by `SlidingArray` Proxies: `length` and indexes are offset, and index 0 is kept, because `chart.left_visible_bar_time`, the drawing helpers and `request.security` read `marketData[0]`.
+- **ta window buffers** (`History` inside CarryHistory / nonNaWindow state) keep max(5,000, 2 × length) entries and never shrink. Between bars they are cut to the `keep` their users last asked for and re-allocated, and `keep` is reset to 0 so the next `keepFor(length)` sets 2 × length.
+- **highest/lowest deques** (`idx/val/head`) drop their dead prefix early. PineTS waits until head > 1024.
+- **Plots, `result`, `alerts` and `warnings`** are cut to their last entry.
+- **`barstate.isconfirmed`** is overridden to `true`, because PineTS indexes `closeTime.data[idx]` absolutely and we only step closed bars.
+- **The shared candle store** is trimmed once instances are warm.
+
+**3. Sharing.** One `SharedScript` (one transpile, ~2 MB) serves every instance of a script, and
+one `FeedStore` per symbol serves every instance on that symbol.
+
+**Internals relied on** (pinets 0.13.1):
+- `PreparedScript.fn` mutable;
+- `$.pine.strategy` methods;
+- `$.pine.barstate`;
+- `$.const/var/let/params/lctx/data/plots/result/alerts/warnings/taState/cache/dataVersion/_varSnapshot/marketData/idx/length/isSecondaryContext`;
+- `PineTS.prototype._snapshotVarState/_restoreVarState`;
+- PineTS's public per-field chart arrays;
+- the cache entries `{pineTS, context}`;
+- the `History` fields `v/nan/ph/pl/qh/ql/off/start/end/keep` and the deque fields `idx/val/head/saved`.
+
+Correctness **(test)**: order calls equal a full run on a broker view that changes every bar.
+
+| Script | Bounds | Bars stepped (after warm-up) | Result |
+|---|---|---|---|
+| probe 01 | keep 200 | 3,000 (warm-up 500) | = full run over 3,500 |
+| KyberSwing | keep 100, daily 50 | 8,008 (warm-up 500) | = full run over 8,508 |
+| KyberSwing | keep 60 + slack 20, daily 10 | 8,008 | = full run over 8,508 |
+| KyberSwing, 2 instances on one SharedScript, different brokers | keep 200 | 3,000 | each = its own full run |
+| KyberSwing untrimmed (incremental daily via the fixed updateTail) | none | 3,000 | = full run |
+| probe 05 daily values (lookahead_on `close[1]`, default `close`, tuple) | keep 50 | 1,100, checked every bar | = full run on every bar |
+
+Further tests **(test)**:
+- With trimming, the main and daily buffers, the ta histories (≤ 512 slots), the deques, alerts and the store all stay bounded, and `marketData[0]` / `marketData[last]` stay readable.
+- **The bound must cover the script's series lookbacks.** A script using `close[50]` matches the full run with keep 60 and diverges with keep 30.
+- KyberSwing itself matches even at keep 30. Its 55-bar windows live in taState, and its series lookbacks are `[1]`. The bound that matters is the largest `x[n]` history reference, not the ta lengths.
+- Not tested: a ta function first called late, after trimming. Its one-time backfill reads up to 5,000 bars of its source series, so it could see fewer bars than in a full run.
+
+### 2b.2 Memory per resident instance (bench)
+
+The bench runs 50 KyberSwing instances in one process with one shared store and script. Each is
+warm-started on 500 bars, then stepped in lockstep. Heap is measured with `process.memoryUsage().heapUsed`
+after `global.gc()` (`--expose-gc`) every 100 passes, minus the baseline taken after the store
+and script were built. Each row gives the min-max in steady state.
+
+| Bounds | Windows, Node 24.19 | Linux `node:24-bookworm`, 1 CPU, 768 MB, Node 24.22 |
+|---|---|---|
+| keep 60 + slack 20, daily 10 (tight for KyberSwing) | 0.42-0.45 MB, flat over 2,000 steps | 0.42-0.45 MB, flat over 1,500 steps |
+| keep 100, daily 50 (safer default) | 0.64-0.69 MB, flat over 4,000 steps (0.65-0.93 MB before the ta/deque/alert trims, rising) | 0.64-0.69 MB, flat over 1,500 steps |
+| no trimming | 1.9 → 5.3 MB after 1,500 steps, +~2.6 KB per bar, unbounded | 1.9 → 4.2 MB after 1,000 steps |
+
+Where the ~0.45 MB goes (tight bounds, freeing one component at a time from all 50 instances):
+
+| Component | KB per instance |
+|---|---|
+| main Context + namespaces + PineTS + generator (fixed) | ~120 |
+| daily `request.security` Context + PineTS (fixed) | ~120 |
+| main var/let/const/params buffers (~71 series × ≤ 80 bars) | ~84 |
+| main ta state | ~28 |
+| main data series | ~18 |
+| daily buffers | ~17 |
+| plots | ~7 |
+
+About 240 KB is fixed cost: PineTS builds every namespace (ta, strategy, array, map, drawing
+helpers, ...) as closures per Context, and KyberSwing has two Contexts.
+
+### 2b.3 Pass time (bench)
+
+One pass = append one bar to the store, then step every instance (median over 500 passes).
+
+| Where | ms per instance per bar | 2,500 instances, one core |
+|---|---|---|
+| Windows, Node, 50 instances | 0.41-0.45 (tight), 0.42-0.45 (default), 0.37 (untrimmed) | ~1.1 s |
+| Linux 1 CPU, Node, 50 instances | 0.71-0.83 (tight), ~1.0 (default) | ~2.0-2.5 s |
+| Linux 1 CPU, one isolate, 50 instances | 1.33 (tight), 1.35 (default) | ~3.3 s |
+| Linux 1 CPU, one isolate, **1,000** instances near its 512 MB limit | 3.87 | ~9.7 s (GC pressure) |
+
+Trimming adds ~15% to the step cost. The step cost is flat per bar.
+
+The 4h fixture was used for all of this. The cost per step does not depend on the chart
+timeframe, but **a 15m chart was not run.** Its daily context gets 96 chart bars per daily bar,
+and updateTail re-executes the developing day every bar, as it does here.
+
+### 2b.4 Isolate layout (bench, Linux container)
+
+| Layout | Heap | Process RSS |
+|---|---|---|
+| One isolate per instance (10 isolates × 1 tight instance) | 6.4 MB used per isolate | +10.3 MB per isolate. **2,500 → ~25 GB. No.** |
+| One isolate, 50 tight instances (limit 256 MB) | 28.8 MB used / 44.3 MB total: 6.8 MB base (bundle + store + script) + 0.45 MB per instance | +122 MB for the whole run |
+| One isolate, 50 default-bound instances | 41.2 MB used / 65.6 MB total (0.69 MB per instance) | +147 MB |
+| One isolate, **1,000** tight instances (limit 512 MB, container 768 MB) | 393.5 MB used / 473.7 MB total (0.39-0.40 MB per instance) | +587 MB |
+
+Per-instance heap is the same inside an isolate as in plain Node. The isolate itself costs
+~2 MB (bundle) plus ~5 MB (store and script), and V8 runs at total ≈ 1.2-1.5 × used.
+`gc()` is available inside isolates when Node runs with `--expose-gc`.
+
+### 2b.5 Verdict
+
+Budget: 768 MB minus ~200 MB for the app, feeds and SQLite leaves ~568 MB for the engine.
+Measured end to end, 1,000 tight instances in one isolate cost **+587 MB RSS** (heap total 474 MB),
+which is already over 568 MB. Process RSS per resident instance is ~0.55-0.6 MB once V8 headroom
+and the isolate are counted (default bounds: ~0.85-0.9 MB).
+
+- **Fits in 768 MB:** about **850-900** KyberSwing instances with tight bounds, or about **550-600** with the safer default bounds, leaving no GC headroom. Plan on ~800 / ~500.
+- **2,500 does not fit.** It needs ~1.4-1.5 GB for the engine at tight bounds (~2.2 GB at default bounds), so a container of about **1.75 GB** (tight) or 2.5 GB (default), with 200 MB for the rest. Alternatively, cap the load at ~800 instances (for example 5 runs × 160 pairs, or fewer runs).
+- **Pass time is fine** at those sizes: ~3.3 s for 2,500 instances in isolates on one Linux core, if the heap is not at its limit. Near the limit, GC triples the cost (3.9 ms per instance per bar at 1,000 in 512 MB). Give each isolate ~30% headroom.
+
+**Recommendation.** Keep instances resident, with bounded history:
+- **Use one isolate per run**, limit ≈ 1.3 × (7 MB + instances × 0.45 MB); for example, 500 tight instances → ~300 MB.
+- **Size the bound per script:** keep = largest series history reference + margin, min ~50; daily keep likewise. Use our own static scan of `x[n]` indexes, fall back to a safe default (100 / 50) when lengths are dynamic, and reject `max_bars_back` above our cap.
+- **Then choose one of:**
+  - (a) give the container ~1.75 GB for 2,500;
+  - (b) cap at ~800 instances in 768 MB;
+  - (c) cut the fixed ~240 KB per instance, which is now the largest part.
+
+  For (c), there are two levers. One is to share the daily `request.security` context between instances with the same script, inputs and symbol: the 5 runs on one pair could share one, saving ~120 KB each, but this is untested. The other is to patch PineTS so namespaces are built once per isolate, not per Context (a fork).
+- Rebuild-per-pass (Task 2) stays the restart path. A warm start of 500 bars takes 75-120 ms per instance; with a lookback-sized window it would be faster.
+
 ## State persistence recommendation
+
+*(Task 2 analysis below. Task 2b changed the recommendation to resident instances with bounded
+history: see "Resident instances with bounded history". A restart then warm-starts each instance
+once, on a window that covers its lookbacks and the oldest open trade.)*
 
 **Do not serialise (not possible, Q4). Rebuild with a warm start, and do not keep thousands of
 instances resident.**
@@ -393,3 +543,6 @@ Alternatives, with trade-offs:
 - Bar-by-bar HTF needs our workaround, because PineTS's `updateTail` gives stale values.
 - Order-argument normalisation is ours. Task 5 should unit-test it against PineTS's own parsed orders (forward mode makes that easy).
 - The windowed rebuild's "open trade older than the window" case is untested (see the persistence rules).
+- Task 2b's resident design depends on even more PineTS internals (listed in 2b.1). The equality tests in `tests/spike/resident.test.ts` are the canary.
+- Stepping makes every bar the last bar: `barstate.islast/isrealtime` are true and `ishistory` is false on each one. A script that orders on those flags behaves like it does live on TradingView, not like its backtest.
+- 15m charts and scripts with several `request.security` calls or other timeframes were not benchmarked.
