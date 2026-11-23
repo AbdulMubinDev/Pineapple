@@ -112,16 +112,26 @@ export class PaperBroker {
     return this.fillMarketOrders(symbol, bar.open, bar.openTime);
   }
 
-  /** Trigger resting stop/limit orders along the bar path (TradingView's intrabar assumption). */
-  onBarRange(symbol: string, bar: Candle): Fill[] {
+  /**
+   * Trigger resting stop/limit orders along the bar path (TradingView's intrabar assumption).
+   * With `liquidation` (binance mode only), the isolated position's liquidation price is checked on the
+   * same path, in order with the orders: whichever the path reaches first acts first, and a tie goes to
+   * the order. The bar's prices stand in for the mark price, which the candles do not carry.
+   */
+  onBarRange(symbol: string, bar: Candle, opts: { liquidation?: boolean } = {}): Fill[] {
     const lowFirst = Math.abs(bar.high - bar.open) >= Math.abs(bar.open - bar.low);
     const path = lowFirst
       ? [bar.open, bar.low, bar.high, bar.close]
       : [bar.open, bar.high, bar.low, bar.close];
-    // Liquidation is not checked here: the replay calls onMark explicitly after the bar.
-    const fills = this.walkPath(symbol, path, bar.openTime);
+    const fills = this.walkPath(symbol, path, bar.openTime, opts.liquidation === true && this.o.mode === 'binance');
     this.lastPrice[symbol] = bar.close;
     return fills;
+  }
+
+  /** Fill pending market orders at `price` plus slippage (process_orders_on_close: the bar's close). */
+  fillMarketAt(symbol: string, price: number, time: number): Fill[] {
+    this.lastPrice[symbol] = price;
+    return this.fillMarketOrders(symbol, price, time);
   }
 
   /** Live tick: market orders fill at price, resting orders trigger on the move from the last price. */
@@ -137,60 +147,16 @@ export class PaperBroker {
     this.lastPrice[symbol] = price;
   }
 
-  /**
-   * Mark price update (binance mode only): liquidates an isolated position once the mark crosses its
-   * liquidation price. The trade closes at LP and the whole isolated margin is lost: the loss up to LP plus
-   * the maintenance remainder, which is forfeited as a clearance fee. Entry fees and funding were already
-   * charged to the balance, so the balance drops by exactly the isolated margin.
-   */
+  /** Mark price update (binance mode only): liquidates an isolated position once the mark crosses its liquidation price. */
   onMark(symbol: string, mark: number, time: number): Fill[] {
     if (this.o.mode !== 'binance') return [];
-    const pos = this.positions[symbol];
-    const m = this.meta[symbol];
-    if (!pos || !m) return [];
-    const long = pos.qty > 0;
-    const qty = Math.abs(pos.qty);
-    const { rate, amount } = maintenance(qty * pos.entryPrice, this.o.rules(symbol).brackets);
-    const lp = liquidationPrice({
-      side: long ? 1 : -1,
-      qty,
-      entryPrice: pos.entryPrice,
-      isolatedMargin: pos.margin,
-      mmr: rate,
-      maintAmount: amount,
-    });
+    const lp = this.liquidationLevel(symbol);
+    if (lp === null) return [];
+    const long = (this.positions[symbol] as Position).qty > 0;
     if (long ? mark > lp : mark < lp) return [];
-
-    this.balance -= pos.margin;
-    this.closed.push({
-      symbol,
-      side: long ? 'long' : 'short',
-      entryTime: pos.openTime,
-      entryPrice: pos.entryPrice,
-      exitTime: time,
-      exitPrice: lp,
-      qty,
-      pnl: -pos.margin,
-      fees: m.fees,
-      funding: m.funding,
-      exitReason: 'liquidation',
-    });
-    delete this.positions[symbol];
-    delete this.meta[symbol];
+    const fill = this.liquidate(symbol, lp, time);
     this.lastPrice[symbol] = mark;
-    this.purgeOrphanExits(symbol);
-    return [
-      {
-        orderId: `liquidation:${symbol}:${time}`,
-        symbol,
-        time,
-        price: lp,
-        qty,
-        side: long ? 'sell' : 'buy',
-        fee: 0,
-        liquidity: 'taker',
-      },
-    ];
+    return [fill];
   }
 
   /**
@@ -295,6 +261,69 @@ export class PaperBroker {
 
   // ---------------------------------------------------------------- internals
 
+  /** The open position's isolated liquidation price, or null when flat. */
+  private liquidationLevel(symbol: string): number | null {
+    const pos = this.positions[symbol];
+    if (!pos || !this.meta[symbol]) return null;
+    const qty = Math.abs(pos.qty);
+    const { rate, amount } = maintenance(qty * pos.entryPrice, this.o.rules(symbol).brackets);
+    return liquidationPrice({
+      side: pos.qty > 0 ? 1 : -1,
+      qty,
+      entryPrice: pos.entryPrice,
+      isolatedMargin: pos.margin,
+      mmr: rate,
+      maintAmount: amount,
+    });
+  }
+
+  /**
+   * Liquidates the isolated position at its liquidation price `lp`. The trade closes at LP and the whole
+   * isolated margin is lost: the loss up to LP plus the maintenance remainder, which is forfeited as a
+   * clearance fee. Entry fees and funding were already charged to the balance, so the balance drops by
+   * exactly the isolated margin.
+   */
+  private liquidate(symbol: string, lp: number, time: number): Fill {
+    const pos = this.positions[symbol] as Position;
+    const m = this.meta[symbol] as PositionMeta;
+    const long = pos.qty > 0;
+    const qty = Math.abs(pos.qty);
+    const orderId = `liquidation:${symbol}:${time}`;
+    this.balance -= pos.margin;
+    this.closed.push({
+      symbol,
+      side: long ? 'long' : 'short',
+      entryTime: pos.openTime,
+      entryPrice: pos.entryPrice,
+      exitTime: time,
+      exitPrice: lp,
+      qty,
+      pnl: -pos.margin,
+      fees: m.fees,
+      funding: m.funding,
+      exitReason: 'liquidation',
+      exitOrderId: orderId,
+    });
+    delete this.positions[symbol];
+    delete this.meta[symbol];
+    this.purgeOrphanExits(symbol);
+    return { orderId, symbol, time, price: lp, qty, side: long ? 'sell' : 'buy', fee: 0, liquidity: 'taker' };
+  }
+
+  /** Where the open position's liquidation price is reached while price moves cursor -> target, or null. */
+  private liquidationTrigger(symbol: string, cursor: number, target: number): { lp: number; t: Trigger } | null {
+    const lp = this.liquidationLevel(symbol);
+    if (lp === null) return null;
+    if ((this.positions[symbol] as Position).qty > 0) {
+      if (cursor <= lp) return { lp, t: { price: cursor, dist: 0 } };
+      if (target <= lp) return { lp, t: { price: lp, dist: cursor - lp } };
+    } else {
+      if (cursor >= lp) return { lp, t: { price: cursor, dist: 0 } };
+      if (target >= lp) return { lp, t: { price: lp, dist: lp - cursor } };
+    }
+    return null;
+  }
+
   private isReduce(o: { reduceOnly: boolean; tag: 'entry' | 'exit' }): boolean {
     return o.reduceOnly || o.tag === 'exit';
   }
@@ -365,7 +394,7 @@ export class PaperBroker {
     return null;
   }
 
-  private walkPath(symbol: string, path: number[], time: number): Fill[] {
+  private walkPath(symbol: string, path: number[], time: number, liquidation = false): Fill[] {
     const fills: Fill[] = [];
     const filledGroups = new Set<string>();
     for (let i = 0; i + 1 < path.length; i++) {
@@ -379,6 +408,12 @@ export class PaperBroker {
           if (ord.ocaGroup !== undefined && filledGroups.has(ord.ocaGroup)) continue;
           const t = this.trigger(ord, cursor, target);
           if (t && (best === null || t.dist < best.t.dist)) best = { ord, t };
+        }
+        const liq = liquidation ? this.liquidationTrigger(symbol, cursor, target) : null;
+        if (liq && (best === null || liq.t.dist < best.t.dist)) {
+          fills.push(this.liquidate(symbol, liq.lp, time));
+          cursor = liq.t.price;
+          continue;
         }
         if (best === null) break;
         cursor = best.t.price;
@@ -411,7 +446,11 @@ export class PaperBroker {
     const maker = ord.type === 'limit' || (ord.type === 'stop_limit' && ord.triggered === true);
     let price = refPrice;
     if (!maker) {
-      price = fillPrice(refPrice, ord.side, this.o.fees.slippagePct);
+      const ticks = this.o.fees.slippageTicks;
+      price =
+        ticks !== undefined
+          ? refPrice + (ord.side === 'buy' ? 1 : -1) * ticks * this.o.rules(ord.symbol).tickSize
+          : fillPrice(refPrice, ord.side, this.o.fees.slippagePct);
       if (this.o.mode === 'binance') {
         price = roundToTick(price, this.o.rules(ord.symbol).tickSize, ord.side === 'buy' ? 'up' : 'down');
       }
@@ -482,6 +521,7 @@ export class PaperBroker {
       fees: entryFees + closeFee,
       funding,
       exitReason: reason,
+      exitOrderId: ord.id,
     });
 
     if (Math.abs(pos.qty) - closeQty <= QTY_EPS) {

@@ -343,8 +343,6 @@ export async function compileScript(source: string): Promise<CompileResult> {
   const errors: CompileError[] = [];
   const setting = (name: string, message: string) => errors.push({ line: tokenLine(lines, name), message });
   if (p.calc_on_order_fills === true) setting('calc_on_order_fills', 'calc_on_order_fills = true is not supported in v1');
-  // The replay fills at the next open; fill-at-close comes with Task 6, which lifts this.
-  if (p.process_orders_on_close === true) setting('process_orders_on_close', 'process_orders_on_close = true is not supported in v1');
   if (p.commission_type !== undefined && p.commission_type !== 'percent') {
     setting('commission_type', `commission_type = ${String(p.commission_type)} is not supported in v1`);
   }

@@ -87,9 +87,9 @@ describe('compileScript', () => {
     expect(r).toEqual({ ok: false, errors: [{ line: 3, message: 'calc_on_order_fills = true is not supported in v1' }] });
   });
 
-  it('compileScript rejects process_orders_on_close (until the replay fills at the close)', async () => {
+  it('compileScript accepts process_orders_on_close (the replay fills at the close)', async () => {
     const r = await compileScript('//@version=6\nstrategy("c", process_orders_on_close = true)\nplot(close)\n');
-    expect(r).toEqual({ ok: false, errors: [{ line: 2, message: 'process_orders_on_close = true is not supported in v1' }] });
+    expect(r).toMatchObject({ ok: true, declaration: { processOrdersOnClose: true } });
   });
 
   it('reports syntax errors and undeclared identifiers with a line', async () => {

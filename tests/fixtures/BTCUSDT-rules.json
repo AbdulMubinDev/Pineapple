@@ -1,0 +1,20 @@
+{
+  "_comment": "TODO(Plan 2): replace with the live rules (exchangeInfo + leverageBracket). Brackets are Binance's published BTCUSDT tiers as recalled, not fetched; each maintAmount follows from the tier before it.",
+  "symbol": "BTCUSDT",
+  "tickSize": 0.1,
+  "stepSize": 0.001,
+  "minNotional": 100,
+  "maxLeverage": 125,
+  "leverageEstimated": false,
+  "brackets": [
+    { "notionalCap": 50000, "maintMarginRate": 0.004, "maintAmount": 0 },
+    { "notionalCap": 500000, "maintMarginRate": 0.005, "maintAmount": 50 },
+    { "notionalCap": 8000000, "maintMarginRate": 0.01, "maintAmount": 2550 },
+    { "notionalCap": 50000000, "maintMarginRate": 0.025, "maintAmount": 122550 },
+    { "notionalCap": 80000000, "maintMarginRate": 0.05, "maintAmount": 1372550 },
+    { "notionalCap": 100000000, "maintMarginRate": 0.1, "maintAmount": 5372550 },
+    { "notionalCap": 200000000, "maintMarginRate": 0.125, "maintAmount": 7872550 },
+    { "notionalCap": 300000000, "maintMarginRate": 0.15, "maintAmount": 12872550 },
+    { "notionalCap": 500000000, "maintMarginRate": 0.25, "maintAmount": 42872550 }
+  ]
+}

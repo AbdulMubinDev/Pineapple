@@ -6,11 +6,13 @@
 // reads the broker. The broker holds one net position per symbol; this layer adds what Pine needs on
 // top: entry ids, the open trades per entry, pyramiding, reversals and the exit orders.
 //
-// How the replay drives it, per bar (Task 6):
+// How the replay drives it, per bar (src/engine/replay.ts, barHooks):
 //   before: fills = broker.onBarOpen(...)   -> submit(layer.onFills(fills, bar, idx))
-//           fills = broker.onBarRange(...)  -> submit(layer.onFills(fills, bar, idx))   (and onMark)
+//           funding events in the bar
+//           fills = broker.onBarRange(...)  -> submit(layer.onFills(fills, bar, idx))   (liquidations included)
 //           broker.markToMarket(close); return layer.scriptView()
 //   after:  submit(layer.toIntents(calls, bar))
+//           process_orders_on_close: fills = broker.fillMarketAt(close) -> submit(layer.onFills(...))
 // Every fill the broker reports for this symbol must reach onFills: the layer's trades are built from
 // them, and scriptView() throws if they no longer add up to the broker's position.
 //
@@ -149,6 +151,11 @@ export class StrategyLayer {
   /** Corrections the layer made after the broker acted (pyramiding overfills, re-sent exit legs). */
   anomalies(): LayerAnomaly[] {
     return this.anomalyLog.map((a) => ({ ...a }));
+  }
+
+  /** The market close that takes a pyramiding overfill lot out (its round trip is not a script trade). */
+  static isOverfillClose(symbol: string, orderId: string): boolean {
+    return orderId.startsWith(`${symbol}|OF|`);
   }
 
   /** A flat view (warm-up, validation): no position, the given equity. */

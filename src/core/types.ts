@@ -38,6 +38,8 @@ export interface FeeConfig {
   makerRate: number;
   takerRate: number;
   slippagePct: number;
+  /** Slippage in ticks of the pair's tick size (TradingView's Properties). When set, it replaces slippagePct. */
+  slippageTicks?: number;
 }
 
 export type BrokerMode = 'tradingview' | 'binance';
@@ -99,6 +101,8 @@ export interface ClosedTrade {
   fees: number;
   funding: number;
   exitReason: 'signal' | 'stop' | 'target' | 'liquidation' | 'delisting';
+  /** The order that closed it (`liquidation:<symbol>:<time>` for a liquidation). Absent in older states. */
+  exitOrderId?: string;
 }
 
 export interface AccountView {
