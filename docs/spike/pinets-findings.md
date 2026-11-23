@@ -429,7 +429,7 @@ Further tests **(test)**:
 - With trimming, these stay bounded: the main and daily buffers, the user-function (`lctx`) buffers (≤ keep + slack + 1), plot data (≤ 8 entries), the ta histories (≤ 512 slots), the deques, alerts and the store. `marketData[0]` and `marketData[last]` stay readable.
 - `barstate` after each `step()`: `islast` and `isrealtime` are true, `ishistory` is false and `isconfirmed` is true. In a full run, `islast` is true on the last bar only. So KyberSwing's `if barstate.islast` table block runs on every stepped bar, and its cost is inside the benched step time.
 - **The bound must cover the script's series lookbacks.** A script using `close[50]` matches the full run with keep 60 and diverges with keep 30.
-- KyberSwing itself matches even at keep 30, with the scripted broker. Its 55-bar windows live in taState, and its series lookbacks are `[1]`. The bound that matters is the largest `x[n]` history reference, not the ta lengths.
+- KyberSwing itself matches even at keep 30 (+5 slack, daily 10), with the scripted broker, over 4,000 bars (3,500 stepped after a 500-bar warm-up). Its 55-bar windows live in taState, and its series lookbacks are `[1]`. The bound that matters is the largest `x[n]` history reference, not the ta lengths.
 - Not tested: a ta function first called late, after trimming. Its one-time backfill reads up to 5,000 bars of its source series, so it could see fewer bars than in a full run.
 
 ### 2b.2 Memory per resident instance (bench)
@@ -526,11 +526,11 @@ page cache (the `npm ci` files), so RSS is the figure to use.
 **Where the RSS beyond the JS heap goes.** For one isolate holding 100 instances after 1,000
 passes (run C), RSS is ≈ (683 − 104) / 5 ≈ 116 MB:
 - V8 heap **total** ≈ 72 MB. V8 keeps ~45% over the 49.6 MB used.
-- ArrayBuffer backing stores ≈ 13 MB. These are outside the heap figures; mostly the ta `History` Float64Arrays, ~0.13 MB per instance.
-- ≈ 30 MB of native memory outside the V8 statistics: the allocator plus V8/isolated-vm structures per isolate.
+- ArrayBuffer backing stores ≈ 13 MB (measured), ~0.13 MB per instance. These are outside the heap figures. That they are mostly the ta `History` Float64Arrays is inferred.
+- ≈ 30 MB left over: native memory outside the V8 statistics. It is a residual (RSS minus the measured parts); that it is the allocator plus V8/isolated-vm structures per isolate is inferred.
 
-`MALLOC_ARENA_MAX=2` cut RSS by 70-80 MB in both layouts (A vs B), so a large part of that is
-glibc arena fragmentation. The 1 × 500 vs 5 × 100 difference (same 500 instances, run C: 582 vs
+`MALLOC_ARENA_MAX=2` cut RSS by 70-80 MB in both layouts (A vs B, single runs each). That suggests
+a large part of the native memory is glibc arena fragmentation, but this is inferred. The 1 × 500 vs 5 × 100 difference (same 500 instances, run C: 582 vs
 683 MB) puts **~25 MB of RSS on each extra isolate**. This is the "fixed ~100 MB" the review
 asked about: in the earlier 50-instance run it was V8 heap headroom, external buffers and native
 memory, which this table now separates.
@@ -546,13 +546,17 @@ separately.
 app server, the market-data feeds, the broker/ledger, SQLite (page cache and connections), plus
 headroom. The bench host (~90-104 MB, including tsx, fixtures and views) is a stand-in. The real
 app's footprint is **not measured**; if it exceeds 200 MB, the engine budget shrinks with it.
+
+Caveats on the bench itself:
+- All benched instances are identical clones: the same script, symbol, candles and scripted broker. Real pairs differ in data and state, so these numbers are likely the best case.
+- The bench host process includes tsx and esbuild (TypeScript loader and bundler), which a production build would not load. The host figure is therefore an upper stand-in for Node itself, but it does not represent the real app.
 **The engine (the isolates) then gets 768 − 200 = 568 MB of RSS.**
 
 **Derived from run C** (engine RSS = final RSS − host part before the first isolate):
 - 1 isolate × 500: 582 − 101 = **481 MB → 0.96 MB per instance**, isolate overhead included.
 - 5 isolates × 100: 683 − 104 = **579 MB → 1.16 MB per instance**.
 - An extra isolate costs ≈ (579 − 481) / 4 ≈ **25 MB**.
-- Model: engine ≈ isolates × 25 MB + instances × 0.92 MB. It fits both points within ±5 MB.
+- Model: **engine ≈ 0.92 MB per instance + ~25 MB per isolate**. This is a two-point fit (two unknowns, two runs), so it reproduces both runs by construction and is not validated beyond them.
 
 **Fit in 768 MB with 200 MB reserved (568 MB engine):**
 - 5 run isolates: (568 − 5 × 25) / 0.92 ≈ **480 instances** (~95 per run). The measured 5 × 100 = 500 needs 579 MB, 11 MB over.
@@ -562,13 +566,13 @@ app's footprint is **not measured**; if it exceeds 200 MB, the engine budget shr
 **2,500 instances:**
 - engine ≈ 5 × 25 + 2,500 × 0.92 ≈ **2.4 GB**;
 - plus 200 MB reserve: **≈ 2.6 GB**;
-- with ~15% headroom for GC and growth: **a 3 GB container**. These are tight bounds; the default bounds (keep 100 / daily 50) need ~1.5× the per-instance heap.
+- with ~15% headroom for GC and growth (a judgement, not measured): **a 3 GB container**. These are tight bounds. The default bounds (keep 100 / daily 50) used ~1.5× the per-instance **heap** in 2b.2. Their RSS was not measured in this layout; assuming RSS scales the same way is unverified.
 
 Alternatively, keep 768 MB and **cap the load at ~450 instances**.
 
 **Pass time:**
 - 2,500 instances, extrapolated linearly from the 500-instance runs (1.47-1.59 ms per instance per bar): **mean ~3.7-4.0 s**.
-- Worst case from the observed max pass (1,355-1,688 ms per 500): **~6.8-8.4 s**. Inside 10 s, but only with heap headroom. At 1,000 instances in an isolate near its limit, the mean alone was 3.87 ms/instance-bar (≈ 9.7 s per 2,500).
+- Extrapolated max, from the observed max pass (1,355-1,688 ms per 500): **~6.8-8.4 s**. Inside 10 s, but only with heap headroom. At 1,000 instances in an isolate near its limit, the mean alone was 3.87 ms/instance-bar (≈ 9.7 s per 2,500).
 - Not measured at 2,500 itself (it does not fit in this container).
 - With a 3 GB container, give each run isolate a limit of ~1.5 × its expected heap total. A run of 500 tight instances holds ~220 MB used / ~335 MB total, so a limit of ~500 MB.
 
@@ -608,7 +612,8 @@ recursive state must converge from the window start.
 
 *(Task 2 analysis below. Task 2b changed the recommendation to resident instances with bounded
 history: see "Resident instances with bounded history". A restart then warm-starts each instance
-once, on a window that covers its lookbacks and the oldest open trade.)*
+once, on a ~3,000-bar window for KyberSwing, which must also start before the oldest open
+trade's entry. A lookback-sized window is not enough (EMA convergence; see 2b.6).)*
 
 **Do not serialise (not possible, Q4). Rebuild with a warm start, and do not keep thousands of
 instances resident.**
