@@ -62,7 +62,20 @@ interface Lot {
   qty: number;
   dir: Dir;
   price: number;
+  /** Exit ids that have filled against this trade: an exit id fills once per trade (TradingView). */
+  exitsFilled: Set<string>;
+  /** Filled past the pyramiding cap (see book): not a script trade, closed at the next open. */
+  overfill?: boolean;
 }
+
+/** Something the layer had to correct after the broker acted; the replay should log these. */
+export interface LayerAnomaly {
+  kind: 'pyramiding_overfill' | 'exit_leg_resent';
+  orderId: string;
+  time: number;
+}
+
+const OVERFILL = '\u0000overfill';
 
 /** An open trade as the script sees it (strategy.opentrades): exits pair with these by close_entries_rule. */
 interface TradeRecord {
@@ -75,7 +88,7 @@ interface TradeRecord {
 }
 
 interface OrderMeta {
-  kind: 'entry' | 'order' | 'exit' | 'close' | 'close_all';
+  kind: 'entry' | 'order' | 'exit' | 'close' | 'close_all' | 'overfill';
   entryId?: string;
   /** exit legs: the exit registration they belong to. */
   exitKey?: string;
@@ -117,6 +130,9 @@ export class StrategyLayer {
   private records: TradeRecord[] = [];
   private readonly meta = new Map<string, OrderMeta>();
   private readonly exits = new Map<string, ExitReg>();
+  /** strategy.entry adds taken off the broker while the pyramiding cap is full (they go back once there is room). */
+  private readonly parked = new Map<string, OrderIntent>();
+  private readonly anomalyLog: LayerAnomaly[] = [];
   private seq = 0;
 
   constructor(
@@ -128,6 +144,11 @@ export class StrategyLayer {
   ) {
     this.rules = opts.rules;
     this.from = opts.from;
+  }
+
+  /** Corrections the layer made after the broker acted (pyramiding overfills, re-sent exit legs). */
+  anomalies(): LayerAnomaly[] {
+    return this.anomalyLog.map((a) => ({ ...a }));
   }
 
   /** A flat view (warm-up, validation): no position, the given equity. */
@@ -167,7 +188,7 @@ export class StrategyLayer {
           break;
       }
     }
-    for (const reg of [...this.exits.values()]) this.syncExit(reg, batch);
+    this.settle(batch, bar.openTime);
     return [...batch.values()];
   }
 
@@ -175,7 +196,8 @@ export class StrategyLayer {
    * Books broker fills for this symbol into the open trades. Returns the exit orders that are now due
    * (an entry filled, or a trade's size changed): submit them before the broker's next price event.
    */
-  onFills(fills: Fill[], _bar: Candle, idx: number): OrderIntent[] {
+  onFills(fills: Fill[], bar: Candle, idx: number): OrderIntent[] {
+    const out = new Map<string, OrderIntent>();
     for (const f of fills) {
       if (f.symbol !== this.symbol) continue;
       if (f.orderId.startsWith('liquidation:')) {
@@ -184,17 +206,51 @@ export class StrategyLayer {
         continue;
       }
       const m = this.meta.get(f.orderId);
-      this.book(f, m, idx);
-      if (m?.kind === 'exit' && m.exitKey) {
-        // A filled exit is used up (its OCA sibling is gone too); a re-issued strategy.exit places a new one.
-        const reg = this.exits.get(m.exitKey);
-        if (reg) this.dropExit(reg);
-      }
-      if (m && (m.kind === 'close' || m.kind === 'close_all')) this.meta.delete(f.orderId);
+      const reg = m?.kind === 'exit' && m.exitKey ? this.exits.get(m.exitKey) : undefined;
+      // An exit id fills once per trade: re-issuing it while the trade is open does nothing (TradingView:
+      // a qty_percent = 50 exit called every bar closes half the trade, not half of the rest each bar).
+      if (reg) for (const l of this.eligibleLots(reg.exitId, reg.fromEntry)) l.exitsFilled.add(reg.exitId);
+      this.book(f, m, idx, out);
+      if (reg) this.dropExit(reg);
+      if (m && (m.kind === 'close' || m.kind === 'close_all' || m.kind === 'overfill')) this.meta.delete(f.orderId);
     }
-    const out = new Map<string, OrderIntent>();
-    for (const reg of [...this.exits.values()]) this.syncExit(reg, out);
+    this.settle(out, bar.openTime);
     return [...out.values()];
+  }
+
+  /** After a bar's calls or a broker event: park / release capped entries, then bring every exit up to date. */
+  private settle(batch: Map<string, OrderIntent>, time: number): void {
+    this.parkCappedEntries(batch);
+    const resting = new Set(this.broker.openOrders(this.symbol).map((o) => o.id));
+    for (const reg of [...this.exits.values()]) this.syncExit(reg, batch, resting, time);
+  }
+
+  /**
+   * Pyramiding is counted when an entry fills (TradingView, PineTS's case "21"). Our broker fills on
+   * its own, so while the cap is full for the position's direction, resting strategy.entry adds in that
+   * direction are taken off the broker and kept here; they go back as soon as there is room again (a
+   * trade closed, or the position went flat or reversed). strategy.order is not limited by pyramiding.
+   */
+  private parkCappedEntries(batch: Map<string, OrderIntent>): void {
+    const net = this.netSize();
+    const full = (d: Dir) => net !== 0 && Math.sign(net) === d && this.tradeLots().filter((l) => l.dir === d).length >= this.decl.pyramiding;
+    for (const o of this.broker.openOrders(this.symbol)) {
+      if (this.meta.get(o.id)?.kind !== 'entry' || batch.has(o.id)) continue;
+      if (full(o.side === 'buy' ? 1 : -1)) {
+        this.broker.cancel(o.id);
+        this.parked.set(o.id, o);
+      }
+    }
+    for (const [id, o] of [...this.parked]) {
+      if (batch.has(id)) {
+        this.parked.delete(id);
+        continue;
+      }
+      if (!full(o.side === 'buy' ? 1 : -1)) {
+        this.parked.delete(id);
+        batch.set(id, o);
+      }
+    }
   }
 
   scriptView(): ScriptView {
@@ -232,10 +288,15 @@ export class StrategyLayer {
     const id = this.entryOrderId(c.id);
     // An entry with the id of an unfilled entry / order modifies it (also on the bar it was placed).
     batch.delete(id);
+    this.parked.delete(id);
     const cur = this.projected(batch);
     const adding = cur !== 0 && Math.sign(cur) === dir;
     // Pyramiding caps adds to a same-direction position by its open entries (not opening, not reversing).
-    if (adding && this.lots.filter((l) => l.dir === dir).length >= this.decl.pyramiding) return;
+    // Market entries queued earlier on this bar fill first, so they count as open by the time this one
+    // fills (pyramiding 1, two entries from flat on one bar: one trade). Resting limit / stop adds are
+    // counted when they fill instead (parkCappedEntries, book).
+    const queued = [...batch.values()].filter((o) => o.type === 'market' && o.tag === 'entry' && !o.reduceOnly && (o.side === 'buy' ? 1 : -1) === dir).length;
+    if (adding && this.tradeLots().filter((l) => l.dir === dir).length + queued >= this.decl.pyramiding) return;
     const { type, limitPrice, stopPrice } = this.levels(c, dir);
     const base = this.baseQty(c.qty, dir, type, limitPrice, stopPrice, bar.close);
     const reversal = cur !== 0 && Math.sign(cur) !== dir;
@@ -258,8 +319,11 @@ export class StrategyLayer {
 
   private exit(c: PineOrderCall, batch: Map<string, OrderIntent>): void {
     const fromEntry = c.fromEntry ?? '';
-    // An exit for an entry that is neither open nor pending places nothing (and replaces nothing).
-    if (fromEntry && !this.lotsOf(fromEntry).length && !this.entryPending(fromEntry, batch)) return;
+    // An exit for an entry that is neither open nor pending places nothing (and replaces nothing). An
+    // open trade this exit id has already filled against does not count: it fills once per trade.
+    const eligible = this.eligibleLots(c.id, fromEntry).length > 0;
+    if (fromEntry && !eligible && !this.entryPending(fromEntry, batch)) return;
+    if (!fromEntry && !eligible && this.tradeLots().length > 0 && !this.anyEntryPending(batch)) return;
     const key = `${c.id}\u0000${fromEntry}`;
     const old = this.exits.get(key);
     if ([c.limit, c.stop, c.profitTicks, c.lossTicks].every((v) => v === undefined)) {
@@ -309,21 +373,26 @@ export class StrategyLayer {
   private cancel(pineId: string, batch: Map<string, OrderIntent>): void {
     const id = this.entryOrderId(pineId);
     batch.delete(id);
+    this.parked.delete(id);
     this.broker.cancel(id);
     for (const reg of [...this.exits.values()]) if (reg.exitId === pineId) this.dropExit(reg, batch);
   }
 
   private cancelAll(batch: Map<string, OrderIntent>): void {
     batch.clear();
-    for (const o of this.broker.openOrders(this.symbol)) if (this.meta.has(o.id)) this.broker.cancel(o.id);
+    this.parked.clear();
+    for (const o of this.broker.openOrders(this.symbol)) {
+      const k = this.meta.get(o.id)?.kind;
+      if (k !== undefined && k !== 'overfill') this.broker.cancel(o.id);
+    }
     for (const reg of [...this.exits.values()]) this.dropExit(reg);
   }
 
   // ------------------------------------------------------------------ exits ----
 
   /** Brings the broker's legs of one exit up to date with its trades (sends changes only). */
-  private syncExit(reg: ExitReg, batch: Map<string, OrderIntent>): void {
-    const lots = reg.fromEntry ? this.lotsOf(reg.fromEntry) : this.lots;
+  private syncExit(reg: ExitReg, batch: Map<string, OrderIntent>, resting: Set<string>, time: number): void {
+    const lots = this.eligibleLots(reg.exitId, reg.fromEntry);
     if (lots.length === 0) {
       // Waiting for its entry, or its trade is gone (then it goes too).
       if (reg.wasLive) this.dropExit(reg, batch);
@@ -348,6 +417,18 @@ export class StrategyLayer {
       [`${base}|limit`, tp === undefined || !(qty > 0) ? null : this.exitLeg(`${base}|limit`, 'limit', this.roundLevel(tp, -dir as Dir, 'limit'), dir, qty, reg, oca)],
       [`${base}|stop`, sl === undefined || !(qty > 0) ? null : this.exitLeg(`${base}|stop`, 'stop', this.roundLevel(sl, -dir as Dir, 'stop'), dir, qty, reg, oca)],
     ];
+    // A leg handed out earlier that the broker does not hold: in a user OCA group a sibling's fill took
+    // it (the exit is used up); otherwise the broker rejected it at submit, so it is sent again.
+    for (const [id] of legs) {
+      if (!reg.sent.has(id) || resting.has(id) || batch.has(id)) continue;
+      if (reg.ocaName) {
+        for (const l of lots) l.exitsFilled.add(reg.exitId);
+        this.dropExit(reg, batch);
+        return;
+      }
+      reg.sent.delete(id);
+      this.anomalyLog.push({ kind: 'exit_leg_resent', orderId: id, time });
+    }
     for (const [id, intent] of legs) {
       if (intent) {
         const json = JSON.stringify(intent);
@@ -411,42 +492,63 @@ export class StrategyLayer {
       if (reg.wasLive) continue;
       const waiting = reg.fromEntry
         ? this.lotsOf(reg.fromEntry).length > 0 || this.entryPending(reg.fromEntry)
-        : this.lots.length > 0 || this.broker.openOrders(this.symbol).some((o) => this.isEntryOrder(o.id));
+        : this.tradeLots().length > 0 || this.anyEntryPending();
       if (!waiting) this.exits.delete(reg.key);
     }
   }
 
+  /** The trades an exit id may still act on: its entry's (or all) script trades it has not filled against. */
+  private eligibleLots(exitId: string, fromEntry: string): Lot[] {
+    return (fromEntry ? this.lotsOf(fromEntry) : this.tradeLots()).filter((l) => !l.exitsFilled.has(exitId));
+  }
+
   // ------------------------------------------------------------------ booking fills ----
 
-  private book(f: Fill, m: OrderMeta | undefined, idx: number): void {
+  private book(f: Fill, m: OrderMeta | undefined, idx: number, out: Map<string, OrderIntent>): void {
     const dir: Dir = f.side === 'buy' ? 1 : -1;
     let qty = f.qty;
     const net = this.netSize();
     if (net !== 0 && Math.sign(net) !== dir) {
       const closing = Math.min(qty, Math.abs(net));
-      const named = m && (m.kind === 'exit' || m.kind === 'close') ? m.entryId : undefined;
-      this.closeLots(closing, named);
-      this.closeRecords(closing, named);
+      const named = m?.kind === 'overfill' ? OVERFILL : m && (m.kind === 'exit' || m.kind === 'close') ? m.entryId : undefined;
+      const fromOverfill = this.closeLots(closing, named);
+      this.closeRecords(closing - fromOverfill, named);
       qty -= closing;
     }
-    if (qty > EPS) {
-      const entryId = m?.entryId ?? f.orderId;
-      this.lots.push({ entryId, qty, dir, price: f.price });
-      this.records.push({ entryId, qty, dir, price: f.price, barIndex: idx, time: f.time });
+    if (qty <= EPS) return;
+    if (m?.kind === 'entry' && net !== 0 && Math.sign(net) === dir && this.tradeLots().filter((l) => l.dir === dir).length >= this.decl.pyramiding) {
+      // An add past the pyramiding cap that the broker filled before the layer could take it off (two
+      // adds filling inside one broker call). TradingView would have cancelled it: it is not a script
+      // trade, and a market close takes it out at the next price event. Logged as an anomaly.
+      this.lots.push({ entryId: OVERFILL, qty, dir, price: f.price, exitsFilled: new Set(), overfill: true });
+      const id = `${this.symbol}|OF|${this.seq++}`;
+      this.meta.set(id, { kind: 'overfill' });
+      out.set(id, this.closeIntent(id, dir, qty));
+      this.anomalyLog.push({ kind: 'pyramiding_overfill', orderId: f.orderId, time: f.time });
+      return;
     }
+    const entryId = m?.entryId ?? f.orderId;
+    this.lots.push({ entryId, qty, dir, price: f.price, exitsFilled: new Set() });
+    this.records.push({ entryId, qty, dir, price: f.price, barIndex: idx, time: f.time });
   }
 
-  /** Physical lots: a close / exit for an entry takes that entry's lots first, oldest first. */
-  private closeLots(qty: number, entryId?: string): void {
+  /**
+   * Physical lots: a close / exit for an entry takes that entry's lots first, oldest first. Returns
+   * the part taken from overfill lots (not script trades).
+   */
+  private closeLots(qty: number, entryId?: string): number {
     const order = entryId ? [...this.lots.filter((l) => l.entryId === entryId), ...this.lots.filter((l) => l.entryId !== entryId)] : this.lots;
     let need = qty;
+    let fromOverfill = 0;
     for (const l of order) {
       if (need <= EPS) break;
       const take = Math.min(l.qty, need);
       l.qty -= take;
       need -= take;
+      if (l.overfill) fromOverfill += take;
     }
     this.lots = this.lots.filter((l) => l.qty > EPS);
+    return fromOverfill;
   }
 
   /** The script's open trades: FIFO pairs any exit with the oldest trades; ANY with the named entry's. */
@@ -482,13 +584,25 @@ export class StrategyLayer {
     return k === 'entry' || k === 'order';
   }
 
+  /** An unfilled entry / order with this id: queued on this bar, resting at the broker or parked. */
   private entryPending(pineId: string, batch?: Map<string, OrderIntent>): boolean {
     const id = this.entryOrderId(pineId);
-    return (batch?.has(id) ?? false) || this.broker.openOrders(this.symbol).some((o) => o.id === id);
+    return (batch?.has(id) ?? false) || this.parked.has(id) || this.broker.openOrders(this.symbol).some((o) => o.id === id);
+  }
+
+  private anyEntryPending(batch?: Map<string, OrderIntent>): boolean {
+    if (this.parked.size > 0) return true;
+    if (batch && [...batch.keys()].some((id) => this.isEntryOrder(id))) return true;
+    return this.broker.openOrders(this.symbol).some((o) => this.isEntryOrder(o.id));
+  }
+
+  /** The script's trades in physical form (overfill lots excluded). */
+  private tradeLots(): Lot[] {
+    return this.lots.filter((l) => !l.overfill);
   }
 
   private lotsOf(entryId: string): Lot[] {
-    return this.lots.filter((l) => l.entryId === entryId);
+    return this.lots.filter((l) => l.entryId === entryId && !l.overfill);
   }
 
   private netSize(): number {

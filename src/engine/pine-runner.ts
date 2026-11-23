@@ -295,7 +295,11 @@ function errorLine(lines: string[], message: string): number {
 
 function readDeclaration(ind: Indicator): StrategyDeclaration {
   const p = ind.prop as Record<string, unknown>;
-  const src = ((ind as unknown as { _sourcePropArgs?: Record<string, unknown> })._sourcePropArgs ?? {}) as Record<string, unknown>;
+  // A PineTS internal (filled by getDeclarationType()): fail loudly if an upgrade renames it rather
+  // than silently reporting nothing as overridden.
+  const raw = (ind as unknown as { _sourcePropArgs?: unknown })._sourcePropArgs;
+  if (raw === null || typeof raw !== 'object') throw new Error('PineTS Indicator#_sourcePropArgs is missing: cannot read the strategy() arguments');
+  const src = raw as Record<string, unknown>;
   const n = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
   const qtyType = p.default_qty_type;
   const overridden: StrategyDeclaration['overridden'] = {};
@@ -339,6 +343,8 @@ export async function compileScript(source: string): Promise<CompileResult> {
   const errors: CompileError[] = [];
   const setting = (name: string, message: string) => errors.push({ line: tokenLine(lines, name), message });
   if (p.calc_on_order_fills === true) setting('calc_on_order_fills', 'calc_on_order_fills = true is not supported in v1');
+  // The replay fills at the next open; fill-at-close comes with Task 6, which lifts this.
+  if (p.process_orders_on_close === true) setting('process_orders_on_close', 'process_orders_on_close = true is not supported in v1');
   if (p.commission_type !== undefined && p.commission_type !== 'percent') {
     setting('commission_type', `commission_type = ${String(p.commission_type)} is not supported in v1`);
   }

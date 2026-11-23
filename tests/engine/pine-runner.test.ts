@@ -1,10 +1,11 @@
 import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { Candle } from '../../src/core/types.js';
+import { PaperBroker } from '../../src/broker/broker.js';
+import type { Candle, OrderIntent, PairRules } from '../../src/core/types.js';
 import { loadCandles } from '../../src/data/csv.js';
 import type { BrokerView } from '../../src/engine/hook-core.js';
 import { compileScript, runStrategy, toPineOrderCall, type PineOrderCall } from '../../src/engine/pine-runner.js';
-import type { ScriptView } from '../../src/engine/strategy-layer.js';
+import { StrategyLayer, type ScriptView } from '../../src/engine/strategy-layer.js';
 import { recordEmulatorViews, runScript } from '../../spike/probe.js';
 
 const probe = (name: string) => readFileSync(`spike/probes/${name}.pine`, 'utf8');
@@ -86,6 +87,11 @@ describe('compileScript', () => {
     expect(r).toEqual({ ok: false, errors: [{ line: 3, message: 'calc_on_order_fills = true is not supported in v1' }] });
   });
 
+  it('compileScript rejects process_orders_on_close (until the replay fills at the close)', async () => {
+    const r = await compileScript('//@version=6\nstrategy("c", process_orders_on_close = true)\nplot(close)\n');
+    expect(r).toEqual({ ok: false, errors: [{ line: 2, message: 'process_orders_on_close = true is not supported in v1' }] });
+  });
+
   it('reports syntax errors and undeclared identifiers with a line', async () => {
     expect(await compileScript('//@version=6\nstrategy("s")\nx = 1 +\ny = )\nplot(x)\n')).toMatchObject({ ok: false, errors: [{ line: 4 }] });
     expect(await compileScript('//@version=6\nstrategy("v")\nplot(foo)\n')).toEqual({ ok: false, errors: [{ line: 3, message: 'Undeclared identifier "foo"' }] });
@@ -119,6 +125,104 @@ describe('compileScript', () => {
     expect(bare).toMatchObject({ ok: true, declaration: { title: 'b', overridden: {} } });
     if (bare.ok) expect(bare.declaration.overridden).toEqual({});
   });
+});
+
+describe("order semantics against PineTS's own emulator (TradingView reference)", () => {
+  const rules: PairRules = { symbol: 'BTCUSDT', tickSize: 0.1, stepSize: 0.001, minNotional: 5, maxLeverage: 125, leverageEstimated: false, brackets: [] };
+
+  /** Per bar: position size, open-trade count and the first open trade's entry id, as the script reads them. */
+  async function throughLayer(source: string, bars: Candle[]) {
+    const c = await compileScript(source);
+    if (!c.ok) throw new Error(JSON.stringify(c.errors));
+    const broker = new PaperBroker({ startingBalance: 1e7, fees: { makerRate: 0, takerRate: 0, slippagePct: 0 }, mode: 'tradingview', rules: () => rules, sizing: { kind: 'script' } });
+    const layer = new StrategyLayer(c.declaration, broker, 'BTCUSDT', { kind: 'script' }, { rules });
+    const submit = (xs: OrderIntent[], t: number) => xs.forEach((x) => broker.submit(x, t));
+    const seen: { pos: number; n: number; id0: string }[] = [];
+    await runStrategy({
+      source,
+      symbol: 'BTCUSDT',
+      tf: '4h',
+      candles: bars,
+      syminfo: SYMINFO,
+      hooks: {
+        before(bar, idx) {
+          if (idx > 0) {
+            submit(layer.onFills(broker.onBarOpen('BTCUSDT', bar), bar, idx), bar.openTime);
+            submit(layer.onFills(broker.onBarRange('BTCUSDT', bar), bar, idx), bar.openTime);
+          }
+          broker.markToMarket('BTCUSDT', bar.close);
+          const v = layer.scriptView();
+          seen.push({ pos: v.positionSize, n: v.openTrades, id0: v.opentrades[0]?.entryId ?? '' });
+          return v;
+        },
+        after(bar, _idx, calls) {
+          submit(layer.toIntents(calls, bar), bar.openTime);
+        },
+      },
+    });
+    return { seen, closed: broker.closedTrades().map((t) => t.qty) };
+  }
+
+  /** The same through PineTS's emulator (every order forwarded), read off the script's plots. */
+  async function throughEmulator(source: string, bars: Candle[]) {
+    const { ctx } = await runScript(source, bars, { provider: true, forward: true });
+    const c = ctx as unknown as { plots: Record<string, { data: { value: unknown }[] }>; strategy: { closedtrades: { size: number }[] } };
+    const col = (n: string) => (c.plots[n]?.data ?? []).map((d) => d.value);
+    const pos = col('pos') as number[];
+    const n = col('n') as number[];
+    const id0 = col('id0') as number[];
+    return {
+      seen: pos.map((p, i) => ({ pos: p, n: n[i]!, id0: ['', 'A', 'B', 'C', 'L'][id0[i]!]! })),
+      closed: c.strategy.closedtrades.map((t) => Math.abs(t.size)),
+    };
+  }
+
+  const PLOTS = `plot(strategy.position_size, "pos")
+plot(strategy.opentrades, "n")
+plot(strategy.opentrades == 0 ? 0 : strategy.opentrades.entry_id(0) == "A" ? 1 : strategy.opentrades.entry_id(0) == "B" ? 2 : strategy.opentrades.entry_id(0) == "C" ? 3 : 4, "id0")
+`;
+  const cases: Record<string, string> = {
+    'FIFO close("B") twice, then close("A")': `//@version=6
+strategy("f", pyramiding = 2, close_entries_rule = "FIFO")
+if bar_index == 1
+    strategy.entry("A", strategy.long, qty = 1)
+if bar_index == 2
+    strategy.entry("B", strategy.long, qty = 1)
+if bar_index == 4
+    strategy.close("B")
+if bar_index == 6
+    strategy.close("B")
+if bar_index == 8
+    strategy.close("A")
+`,
+    'pyramiding 1, two entries on one bar': `//@version=6
+strategy("p", pyramiding = 1)
+if bar_index == 1
+    strategy.entry("A", strategy.long, qty = 1)
+    strategy.entry("B", strategy.long, qty = 1)
+if bar_index == 5
+    strategy.close_all()
+`,
+    'qty_percent 50 exit re-issued every bar': `//@version=6
+strategy("h")
+if bar_index == 1
+    strategy.entry("L", strategy.long, qty = 1)
+if bar_index > 1
+    strategy.exit("tp", "L", qty_percent = 50, limit = close * 0.99)
+if bar_index == 12
+    strategy.exit("all", "L", limit = close * 0.99)
+`,
+  };
+
+  for (const [name, body] of Object.entries(cases)) {
+    it(name, async () => {
+      const bars = candles.slice(0, 20);
+      const ours = await throughLayer(body + PLOTS, bars);
+      const ref = await throughEmulator(body + PLOTS, bars);
+      expect(ours.seen).toEqual(ref.seen);
+      expect(ours.closed).toEqual(ref.closed);
+    });
+  }
 });
 
 describe('runStrategy', () => {

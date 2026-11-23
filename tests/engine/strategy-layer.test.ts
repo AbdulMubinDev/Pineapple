@@ -46,14 +46,17 @@ function rig(o: { d?: Partial<StrategyDeclaration>; sizing?: SizingRule; balance
   });
   const layer = new StrategyLayer(decl(o.d), broker, SYM, sizing, { rules, from: o.from });
   const rejected: OrderIntent[] = [];
+  /** Intents this returns true for are treated as rejected at submit (never reach the broker). */
+  const ctl: { reject?: (i: OrderIntent) => boolean } = {};
   const submit = (intents: OrderIntent[], now: number) => {
-    for (const i of intents) if (!broker.submit(i, now).accepted) rejected.push(i);
+    for (const i of intents) if (ctl.reject?.(i) || !broker.submit(i, now).accepted) rejected.push(i);
   };
   let idx = 0;
   return {
     broker,
     layer,
     rejected,
+    ctl,
     /** hooks.before: the bar's broker events, then the script's view. */
     before(b: Candle) {
       submit(layer.onFills(broker.onBarOpen(SYM, b), b, idx), b.openTime);
@@ -300,6 +303,105 @@ describe('StrategyLayer', () => {
     const r = rig();
     expect(r.after(flatBar(0), [entry('A', 'long', { qty: 1 }), { kind: 'cancel_all', id: '' }])).toEqual([]);
     expect(r.after(flatBar(1), [{ kind: 'cancel_all', id: '' }, entry('A', 'long', { qty: 1 })])).toHaveLength(1);
+  });
+
+  // ------------------------------------------------------------------ fix round 1 ----
+
+  it('an exit id fills once per trade: qty_percent = 50 re-issued every bar closes exactly half', () => {
+    const r = rig();
+    const tp = exit('tp', { fromEntry: 'L', qtyPercent: 50, limit: 49_000 }); // marketable: fills at the next open
+    r.after(flatBar(0), [entry('L', 'long', { qty: 1 })]);
+    r.before(flatBar(1));
+    r.after(flatBar(1), [tp]);
+    expect(r.before(flatBar(2)).positionSize).toBe(0.5);
+    for (let i = 2; i < 6; i++) {
+      expect(r.after(flatBar(i), [tp])).toEqual([]);
+      expect(r.before(flatBar(i + 1)).positionSize).toBe(0.5);
+    }
+    expect(r.broker.closedTrades().map((t) => t.qty)).toEqual([0.5]);
+    // Another exit id still acts on the rest; a new trade gets the old id again.
+    r.after(flatBar(6), [exit('x2', { fromEntry: 'L', limit: 49_000 })]);
+    expect(r.before(flatBar(7)).positionSize).toBe(0);
+    r.after(flatBar(7), [entry('L', 'long', { qty: 1 })]);
+    r.before(flatBar(8));
+    r.after(flatBar(8), [tp]);
+    expect(r.before(flatBar(9)).positionSize).toBe(0.5);
+  });
+
+  it('pyramiding 1: two entries on one bar from flat give one trade', () => {
+    const r = rig({ d: { pyramiding: 1 } });
+    const intents = r.after(flatBar(0), [entry('A', 'long', { qty: 1 }), entry('B', 'long', { qty: 1 })]);
+    expect(intents.map((i) => i.entryId)).toEqual(['A']);
+    expect(r.before(flatBar(1))).toMatchObject({ positionSize: 1, openTrades: 1 });
+  });
+
+  it('pyramiding is counted at fill: a resting add waits off the broker while the cap is full', () => {
+    const r = rig({ d: { pyramiding: 2 } });
+    r.after(flatBar(0), [entry('A', 'long', { qty: 1 })]);
+    r.before(flatBar(1));
+    // Two resting adds: both may be placed (one slot left), only the first to fill counts.
+    expect(r.after(flatBar(1), [entry('B', 'long', { qty: 1, limit: 49_000 }), entry('C', 'long', { qty: 1, limit: 48_000 })])).toHaveLength(2);
+    r.before(bar(2, 50_000, 50_000, 48_900, 49_500)); // B fills; the cap is full, C leaves the broker
+    expect(r.layer.scriptView().opentrades.map((t) => t.entryId)).toEqual(['A', 'B']);
+    expect(r.broker.openOrders(SYM)).toEqual([]);
+    r.after(bar(2, 50_000, 50_000, 48_900, 49_500), [{ kind: 'close', id: 'A' }]);
+    // A closes at the open: room again, so C is back at the broker and fills on this bar's low.
+    r.before(bar(3, 49_500, 49_600, 47_900, 48_500));
+    expect(r.layer.scriptView().opentrades.map((t) => t.entryId)).toEqual(['B', 'C']);
+    expect(r.layer.anomalies()).toEqual([]);
+  });
+
+  it('two resting adds filling inside one broker call: the one past the cap is closed and logged', () => {
+    const r = rig({ d: { pyramiding: 2 } });
+    r.after(flatBar(0), [entry('A', 'long', { qty: 1 })]);
+    r.before(flatBar(1));
+    r.after(flatBar(1), [entry('B', 'long', { qty: 1, limit: 49_000 }), entry('C', 'long', { qty: 1, limit: 48_000 })]);
+    const v = r.before(bar(2, 50_000, 50_000, 47_500, 48_500)); // both levels on one path
+    expect(v.opentrades.map((t) => t.entryId)).toEqual(['A', 'B']);
+    expect(v.positionSize).toBe(3); // the overfill is in the broker until the next open
+    expect(r.layer.anomalies()).toEqual([{ kind: 'pyramiding_overfill', orderId: 'BTCUSDT|E|C', time: T0 + 2 * H4 }]);
+    r.after(bar(2, 50_000, 50_000, 47_500, 48_500), []);
+    expect(r.before(flatBar(3, 48_500))).toMatchObject({ positionSize: 2, openTrades: 2 });
+  });
+
+  it('FIFO close("B") pairs with A in opentrades but takes B\'s own lot: a second close("B") does nothing', () => {
+    // TradingView's two books (PineTS 0.13.1 openTradeList / closeMatching, and the emulator-parity test
+    // in pine-runner.test.ts): the script sees B open, while B's own quantity is gone.
+    const r = rig({ d: { pyramiding: 2, closeEntriesRule: 'FIFO' } });
+    r.after(flatBar(0), [entry('A', 'long', { qty: 1 })]);
+    r.before(flatBar(1));
+    r.after(flatBar(1), [entry('B', 'long', { qty: 1 })]);
+    r.before(flatBar(2));
+    r.after(flatBar(2), [{ kind: 'close', id: 'B' }]);
+    expect(r.before(flatBar(3)).opentrades.map((t) => t.entryId)).toEqual(['B']);
+    expect(r.after(flatBar(3), [{ kind: 'close', id: 'B' }])).toEqual([]);
+    expect(r.before(flatBar(4)).positionSize).toBe(1);
+    expect(r.after(flatBar(4), [{ kind: 'close', id: 'A' }])).toHaveLength(1);
+    expect(r.before(flatBar(5))).toMatchObject({ positionSize: 0, openTrades: 0 });
+  });
+
+  it('an exit leg the broker did not take is sent again and logged', () => {
+    const r = rig();
+    r.after(flatBar(0), [entry('L', 'long', { qty: 1 })]);
+    r.before(flatBar(1));
+    r.ctl.reject = (i) => i.tag === 'exit';
+    r.after(flatBar(1), [exit('X', { fromEntry: 'L', stop: 48_000 })]);
+    expect(r.broker.openOrders(SYM)).toEqual([]);
+    r.ctl.reject = undefined;
+    r.before(flatBar(2));
+    expect(r.broker.openOrders(SYM)).toEqual([expect.objectContaining({ type: 'stop', stopPrice: 48_000 })]);
+    expect(r.layer.anomalies()).toEqual([{ kind: 'exit_leg_resent', orderId: 'BTCUSDT|X|X|L|stop', time: T0 + 2 * H4 }]);
+  });
+
+  it('a held exit is dropped when its pending entry is rejected at the broker', () => {
+    const r = rig({ balance: 1_000 });
+    r.after(flatBar(0), [entry('L', 'long', { qty: 1 }), exit('X', { fromEntry: 'L', stop: 45_000 })]);
+    expect(r.rejected.map((i) => i.entryId)).toEqual(['L']);
+    r.before(flatBar(1));
+    r.after(flatBar(1), [entry('L', 'long', { qty: 0.01 })]); // fits; the stale exit must not come with it
+    r.before(flatBar(2));
+    expect(r.broker.position(SYM)).toMatchObject({ qty: 0.01 });
+    expect(r.broker.openOrders(SYM)).toEqual([]);
   });
 
   it('a liquidation fill (binance mode onMark) empties the open trades', () => {
