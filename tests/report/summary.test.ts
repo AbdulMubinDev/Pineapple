@@ -75,6 +75,8 @@ describe('formatPrice', () => {
     expect(formatPrice(0.00000123)).toBe('0.00000123');
     expect(formatPrice(1.5e-7)).toBe('0.00000015');
     expect(formatPrice(0)).toBe('0');
+    expect(formatPrice(-1e-10)).toBe('0');
+    expect(formatPrice(-2.5)).toBe('-2.5');
   });
 
   it('the CSV writes tiny prices the same way', () => {

@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { PaperBroker } from '../../src/broker/broker.js';
-import type { Candle, OrderIntent, PairRules, SizingRule } from '../../src/core/types.js';
+import type { BrokerMode, Candle, OrderIntent, PairRules, SizingRule } from '../../src/core/types.js';
 import type { PineOrderCall, StrategyDeclaration } from '../../src/engine/pine-runner.js';
+import { splitOverfills } from '../../src/engine/replay.js';
 import { StrategyLayer } from '../../src/engine/strategy-layer.js';
 
 const SYM = 'BTCUSDT';
@@ -35,12 +36,12 @@ const entry = (id: string, direction: 'long' | 'short', more: Partial<PineOrderC
 const exit = (id: string, more: Partial<PineOrderCall> = {}): PineOrderCall => ({ kind: 'exit', id, ...more });
 
 /** A broker plus layer driven the way the replay (Task 6) drives them. */
-function rig(o: { d?: Partial<StrategyDeclaration>; sizing?: SizingRule; balance?: number; from?: number } = {}) {
+function rig(o: { d?: Partial<StrategyDeclaration>; sizing?: SizingRule; balance?: number; from?: number; mode?: BrokerMode } = {}) {
   const sizing = o.sizing ?? { kind: 'script' };
   const broker = new PaperBroker({
     startingBalance: o.balance ?? 1_000_000,
     fees: { makerRate: 0, takerRate: 0, slippagePct: 0 },
-    mode: 'tradingview',
+    mode: o.mode ?? 'tradingview',
     rules: () => rules,
     sizing,
   });
@@ -373,11 +374,40 @@ describe('StrategyLayer', () => {
     r.after(bar(2, 50_000, 50_000, 47_500, 48_500), [{ kind: 'close_all', id: '' }]);
     r.before(flatBar(3, 51_000)); // the overfill close, then close_all, both at 51000
     const [of, all] = r.layer.attributions();
-    expect(of!.parts).toEqual([{ kind: 'overfill', qty: 1, entryPrice: 48_000, pnl: 3_000 }]);
+    expect(of!.parts).toEqual([{ kind: 'overfill', qty: 1, entryPrice: 48_000, entryTime: T0 + 2 * H4, pnl: 3_000 }]);
     expect(all!.parts).toEqual([{ kind: 'script', qty: 2, entryPrice: 49_500, pnl: 3_000 }]);
     // Broker: avg 49000 for all three, 3 x 2000 = 6000 = 3000 + 3000.
     expect(r.broker.closedTrades().reduce((s, t) => s + t.pnl, 0)).toBeCloseTo(6_000, 8);
     expect(r.layer.anomalies().map((a) => a.kind)).toEqual(['pyramiding_overfill']);
+    // The overfill lot filled on bar 2; the broker's position (and trade) dates from A on bar 1.
+    const { trades, overfills } = splitOverfills(r.broker.closedTrades(), r.layer.attributions());
+    expect(overfills.map((t) => t.entryTime)).toEqual([T0 + 2 * H4]);
+    expect(trades.map((t) => t.entryTime)).toEqual([T0 + H4]);
+  });
+
+  it('a liquidation of a tainted position is split too: script + overfill = broker total', () => {
+    // Binance mode, 5x (margin 20), pyramiding 1: A @ 100 and C @ 90 fill on one path (C is the overfill).
+    const r = rig({ d: { pyramiding: 1, marginLong: 20 }, mode: 'binance', balance: 10_000 });
+    r.after(flatBar(0, 105), [entry('A', 'long', { qty: 1, limit: 100 }), entry('C', 'long', { qty: 1, limit: 90 })]);
+    r.before(bar(1, 105, 105, 89, 91)); // broker average 95
+    r.after(bar(1, 105, 105, 89, 91), []);
+    r.before(flatBar(2, 92)); // the overfill close at 92: broker -3, the overfill's own +2
+    r.after(flatBar(2, 92), []);
+    const liq = r.broker.onMark(SYM, 70, T0 + 3 * H4); // A alone left, liquidated
+    expect(liq).toHaveLength(1);
+    r.layer.onFills(liq, flatBar(3, 70), 3);
+    const broker = r.broker.closedTrades();
+    expect(broker.map((t) => t.exitReason)).toEqual(['signal', 'liquidation']);
+    const { trades, overfills } = splitOverfills(broker, r.layer.attributions());
+    expect(overfills.map((t) => t.pnl)).toEqual([2]);
+    expect(overfills[0]!.entryTime).toBe(T0 + H4);
+    expect(trades).toHaveLength(1);
+    expect(trades[0]!.entryPrice).toBe(100);
+    // The broker books the whole isolated margin (19) at its average entry 95; at A's own 100 that is 5 more.
+    expect(trades[0]!.pnl).toBeCloseTo(-24, 8);
+    const total = (xs: { pnl: number }[]) => xs.reduce((s, t) => s + t.pnl, 0);
+    expect(total(trades) + total(overfills)).toBeCloseTo(total(broker), 8);
+    expect(r.layer.scriptView().positionSize).toBe(0);
   });
 
   it('a script close that takes the overfill quantity first is split and logged as overfill_absorbed', () => {
@@ -393,7 +423,7 @@ describe('StrategyLayer', () => {
     const [all] = r.layer.attributions();
     expect(all!.parts).toEqual([
       { kind: 'script', qty: 2, entryPrice: 49_500, pnl: 3_000 },
-      { kind: 'overfill', qty: 1, entryPrice: 48_000, pnl: 3_000 },
+      { kind: 'overfill', qty: 1, entryPrice: 48_000, entryTime: T0 + 2 * H4, pnl: 3_000 },
     ]);
     expect(r.layer.anomalies().map((a) => a.kind)).toEqual(['pyramiding_overfill', 'overfill_absorbed']);
   });

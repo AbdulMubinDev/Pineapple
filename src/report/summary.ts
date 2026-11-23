@@ -64,7 +64,8 @@ const iso = (t: number) => new Date(t).toISOString();
 /** A price to 8 dp without trailing zeros, never in exponent notation (an averaged entry can carry float noise). */
 export function formatPrice(n: number): string {
   const s = n.toFixed(8);
-  return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s;
+  const t = s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s;
+  return t === '-0' ? '0' : t;
 }
 const price = formatPrice;
 

@@ -173,9 +173,20 @@ export function splitOverfills(closed: ClosedTrade[], attributions: TradeAttribu
       trades.push(t);
       continue;
     }
+    // What the broker booked beyond the price move from its averaged entry: 0 for an ordinary fill, the
+    // forfeited maintenance remainder for a liquidation (it books the whole isolated margin). Split by qty.
+    const residual = t.pnl - (t.side === 'long' ? 1 : -1) * (t.exitPrice - t.entryPrice) * t.qty;
     for (const p of a.parts) {
       const share = p.qty / t.qty;
-      const part: ClosedTrade = { ...t, qty: p.qty, entryPrice: p.entryPrice, pnl: p.pnl, fees: t.fees * share, funding: t.funding * share };
+      const part: ClosedTrade = {
+        ...t,
+        entryTime: p.entryTime ?? t.entryTime,
+        qty: p.qty,
+        entryPrice: p.entryPrice,
+        pnl: p.pnl + residual * share,
+        fees: t.fees * share,
+        funding: t.funding * share,
+      };
       (p.kind === 'script' ? trades : overfills).push(part);
     }
   }
