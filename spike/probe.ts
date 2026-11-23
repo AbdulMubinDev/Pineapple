@@ -222,6 +222,41 @@ export async function runScript(source: string, candles: Candle[], opts: RunOpti
   return { ctx: ctx as unknown as Ctx, calls: hooked.calls, pine };
 }
 
+/**
+ * A scripted broker for equality tests: runs the script once with every order forwarded to
+ * PineTS's emulator and records, per bar, what the read-back getters returned (position, avg
+ * price, equity, open trades...). Replaying those views makes a hooked run take and leave real
+ * positions, so in-position branches (trailing stops, exits) run.
+ */
+export async function recordEmulatorViews(source: string, candles: Candle[]): Promise<BrokerView[]> {
+  const views: BrokerView[] = [];
+  await runScript(source, candles, {
+    provider: true,
+    forward: true,
+    onNewBar: ($) => {
+      const ns = $.pine.strategy as unknown as Record<string, () => unknown>;
+      const ot = ns.opentrades!() as { valueOf(): number; size(i: number): number; entry_price(i: number): number; entry_id(i: number): string; entry_bar_index(i: number): number; entry_time(i: number): number; profit(i: number): number };
+      const n = Number(ot.valueOf());
+      views[$.idx] = {
+        position_size: ns.position_size!() as number,
+        position_avg_price: ns.position_avg_price!() as number,
+        equity: ns.equity!() as number,
+        netprofit: ns.netprofit!() as number,
+        openprofit: ns.openprofit!() as number,
+        opentrades: Array.from({ length: n }, (_, i) => ({
+          id: ot.entry_id(i),
+          size: ot.size(i),
+          entry_price: ot.entry_price(i),
+          entry_bar_index: ot.entry_bar_index(i),
+          entry_time: ot.entry_time(i),
+          profit: ot.profit(i),
+        })),
+      };
+    },
+  });
+  return views;
+}
+
 // ------------------------------------------------------------ bar-by-bar ----
 
 /** Appends a closed bar to a running PineTS (its public per-field arrays) for the paginated loop. */

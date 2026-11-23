@@ -5,10 +5,10 @@
 // same code the Node tests check. Prints JSON lines:
 //  - one isolate holding N trimmed KyberSwing instances: isolate heap and process RSS,
 //  - K isolates holding 1 instance each: the fixed cost of an isolate.
-import { build } from 'esbuild';
 import ivm from 'isolated-vm';
 import { pinetsBrowserBundle } from './isolate.js';
 import { BTCUSDT_PERP_SYMINFO, fixtureCandles, probeSource } from './probe.js';
+import { residentBundle } from './resident-bundle.js';
 
 const [n = 50, steps = 1000, isolates = 10, keep = 100, htfKeep = 50, slackArg = 0, WARM = 3000, limitMb = 256] = process.argv.slice(2).map(Number);
 const slack = slackArg > 0 ? slackArg : keep;
@@ -18,35 +18,6 @@ const rss = () => {
   gc();
   return process.memoryUsage().rss;
 };
-
-async function residentBundle(): Promise<string> {
-  const out = await build({
-    stdin: {
-      contents: "export { FeedStore, SharedScript, ResidentInstance } from './resident.ts';",
-      resolveDir: new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'),
-      loader: 'ts',
-    },
-    bundle: true,
-    format: 'iife',
-    globalName: 'Resident',
-    platform: 'neutral',
-    target: 'es2022',
-    write: false,
-    plugins: [
-      {
-        name: 'pinets-global',
-        setup(b) {
-          b.onResolve({ filter: /^pinets$/ }, () => ({ path: 'pinets', namespace: 'pinets-global' }));
-          b.onLoad({ filter: /.*/, namespace: 'pinets-global' }, () => ({
-            contents: 'export const PineTS = globalThis.PineTSLib.PineTS; export const Indicator = globalThis.PineTSLib.Indicator;',
-            loader: 'js',
-          }));
-        },
-      },
-    ],
-  });
-  return out.outputFiles[0]!.text;
-}
 
 // Runs inside the isolate. Candles arrive as a copied array; nothing from Node is reachable.
 const DRIVER = `

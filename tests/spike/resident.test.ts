@@ -2,7 +2,7 @@
 // trimming, order calls equal a full run over 3,000+ bars, for KyberSwing and probe 01.
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Candle } from '../../src/core/types.js';
-import { BTCUSDT_PERP_SYMINFO, aggregateDaily, fixtureCandles, probeSource, runScript, type BrokerView, type OrderCall } from '../../spike/probe.js';
+import { BTCUSDT_PERP_SYMINFO, aggregateDaily, fixtureCandles, probeSource, recordEmulatorViews, runScript, type BrokerView, type OrderCall } from '../../spike/probe.js';
 import { FeedStore, ResidentInstance, SharedScript } from '../../spike/resident.js';
 
 const fetchSpy = vi.fn(() => {
@@ -177,4 +177,129 @@ describe('resident instances with bounded history', () => {
     expect(calls[1]).toEqual(fulls[1]!.calls);
     expect(calls[0]).not.toEqual(calls[1]); // different equity -> different qty
   }, 120_000);
+});
+
+// A scripted broker: per bar, the read-backs PineTS's own emulator gave this script in a full run
+// with every order forwarded. Replayed into a hooked run, the script holds real positions.
+describe('resident instances with a scripted broker (real positions)', () => {
+  let kyberViews: BrokerView[];
+  beforeAll(async () => {
+    kyberViews = await recordEmulatorViews(probeSource('08-kyberswing'), candles);
+  }, 60_000);
+
+  const inPositionStats = (calls: OrderCall[], views: BrokerView[]) => {
+    const barsInPosition = views.filter((v) => v.position_size !== 0).length;
+    let opens = 0;
+    let closes = 0;
+    for (let i = 1; i < views.length; i++) {
+      if (views[i - 1]!.position_size === 0 && views[i]!.position_size !== 0) opens++;
+      if (views[i - 1]!.position_size !== 0 && views[i]!.position_size === 0) closes++;
+    }
+    // Stop ratchet: the exit's stop changes from bar to bar while a position is held.
+    let ratchets = 0;
+    let prev: number | undefined;
+    for (const c of calls) {
+      const pos = views[c.bar]!.position_size;
+      if (c.method !== 'exit' || pos === 0) continue;
+      if ((c.args.id === 'L-X' && pos > 0) || (c.args.id === 'S-X' && pos < 0)) {
+        const stop = c.args.stop as number;
+        if (prev !== undefined && Number.isFinite(stop) && stop !== prev) ratchets++;
+        prev = stop;
+      }
+    }
+    return { barsInPosition, opens, closes, ratchets };
+  };
+
+  it('KyberSwing, tight bounds (60 + 20 slack, daily 10): same order calls as the full run over 8,508 bars while holding real positions', async () => {
+    const broker = (bar: number) => kyberViews[bar]!;
+    const full = await runScript(probeSource('08-kyberswing'), candles, { provider: true, broker });
+    const r = await resident(probeSource('08-kyberswing'), candles, 500, { keep: 60, htfKeep: 10, slack: 20, broker });
+    const st = inPositionStats(full.calls, kyberViews);
+    if (process.env.SPIKE_LOG) console.log('[2b] scripted KyberSwing:', JSON.stringify({ ...st, calls: full.calls.length }));
+    expect(st.opens).toBeGreaterThan(50); // positions opened ...
+    expect(st.closes).toBeGreaterThan(50); // ... and closed by the exits
+    expect(st.barsInPosition).toBeGreaterThan(1000);
+    expect(st.ratchets).toBeGreaterThan(100); // the in-position trailing-stop branch ran
+    expect(r.calls.length).toBe(full.calls.length);
+    expect(r.calls).toEqual(full.calls);
+  }, 180_000);
+
+  it('KyberSwing matches even at keep 30 (+5 slack, daily 10): its windows live in taState, its series lookbacks are [1]', async () => {
+    const broker = (bar: number) => kyberViews[bar]!;
+    const bars = candles.slice(0, 4000);
+    const full = await runScript(probeSource('08-kyberswing'), bars, { provider: true, broker });
+    const r = await resident(probeSource('08-kyberswing'), bars, 500, { keep: 30, htfKeep: 10, slack: 5, broker });
+    expect(r.calls).toEqual(full.calls);
+  }, 120_000);
+
+  it('probe 01 with its own emulator fills replayed, trimmed to 200 bars: same calls over 3,500 bars', async () => {
+    const bars = candles.slice(0, 3500);
+    const views = await recordEmulatorViews(ungated('01-ma-cross'), bars);
+    expect(views.filter((v) => v.position_size !== 0).length).toBeGreaterThan(1000);
+    const broker = (bar: number) => views[bar]!;
+    const full = await runScript(ungated('01-ma-cross'), bars, { provider: true, broker });
+    const r = await resident(ungated('01-ma-cross'), bars, 500, { keep: 200, broker });
+    expect(r.calls).toEqual(full.calls);
+  }, 120_000);
+
+  it('user-function scope (lctx) buffers and plot data are trimmed too, with identical calls', async () => {
+    const src = [
+      '//@version=6',
+      'strategy("fn")',
+      'f(float src, int n) =>',
+      '    d = src - src[n]',
+      '    d[1]',
+      'v = f(close, 10)',
+      'if v > 0',
+      '    strategy.entry("L", strategy.long)',
+      'if v < 0',
+      '    strategy.close("L")',
+      'plot(v, "v")',
+      '',
+    ].join('\n');
+    const bars = candles.slice(0, 3000);
+    const full = await runScript(src, bars, { provider: true, broker: moving });
+    const r = await resident(src, bars, 300, { keep: 20, slack: 10, broker: moving });
+    expect(r.calls.length).toBeGreaterThan(100);
+    expect(r.calls).toEqual(full.calls);
+    type Scope = Record<string, { data?: unknown[] } | unknown[]>;
+    const ctx = r.inst.ctx as unknown as { lctx: Map<string, Record<string, Scope | undefined>>; plots: Record<string, { data: unknown[] }> };
+    let lctxBuffers = 0;
+    ctx.lctx.forEach((c) => {
+      for (const scope of ['var', 'let', 'const', 'params']) {
+        for (const item of Object.values(c[scope] ?? {})) {
+          const arr = Array.isArray(item) ? item : item.data;
+          if (!arr) continue;
+          lctxBuffers++;
+          expect(arr.length).toBeLessThanOrEqual(31);
+        }
+      }
+    });
+    expect(lctxBuffers).toBeGreaterThan(0);
+    for (const p of Object.values(ctx.plots)) if (Array.isArray(p.data)) expect(p.data.length).toBeLessThanOrEqual(8);
+  }, 60_000);
+
+  it('stepping makes every bar the last, realtime bar: islast/isrealtime true, ishistory false, isconfirmed true', async () => {
+    const src = [
+      '//@version=6',
+      'strategy("bs")',
+      'plot(barstate.islast ? 1 : 0, "islast")',
+      'plot(barstate.isrealtime ? 1 : 0, "rt")',
+      'plot(barstate.ishistory ? 1 : 0, "hist")',
+      'plot(barstate.isconfirmed ? 1 : 0, "conf")',
+      '',
+    ].join('\n');
+    const bars = candles.slice(0, 300);
+    const full = await runScript(src, bars, { provider: true, broker: moving });
+    const col = (ctx: unknown, n: string) => (ctx as { plots: Record<string, { data: { value: unknown }[] }> }).plots[n]!.data.map((d) => d.value);
+    expect(col(full.ctx, 'islast').slice(0, -1).every((v) => v === 0)).toBe(true); // full run: only the last bar
+    const store = new FeedStore('240', 14_400_000, BTCUSDT_PERP_SYMINFO, bars.slice(0, 100));
+    const inst = await ResidentInstance.create(new SharedScript(src), store, { broker: moving, keep: 50 });
+    for (const c of bars.slice(100)) {
+      store.append(c);
+      await inst.step();
+      const last = (n: string) => col(inst.ctx, n).at(-1);
+      expect([last('islast'), last('rt'), last('hist'), last('conf')]).toEqual([1, 1, 0, 1]);
+    }
+  }, 60_000);
 });

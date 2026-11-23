@@ -395,30 +395,41 @@ snapshotted and restored as well. The fix applies only to PineTS instances fed b
 one `FeedStore` per symbol serves every instance on that symbol.
 
 **Internals relied on** (pinets 0.13.1):
-- `PreparedScript.fn` mutable;
+- `PreparedScript.fn` mutable and reused by `run()`, with `_pineVersion` / `_ltfSlices` read off it (copied onto our wrapper);
+- `run(indicator, undefined, pageSize)` generator paging (it re-reads `data.length` before each page), after `pine.ready()`;
+- `PineTS#source` (the `fixUpdateTail` flag is read from it, also on secondaries PineTS creates itself);
 - `$.pine.strategy` methods;
-- `$.pine.barstate`;
+- `$.pine.barstate`, where `isconfirmed` is redefinable on the instance (`Object.defineProperty`);
 - `$.const/var/let/params/lctx/data/plots/result/alerts/warnings/taState/cache/dataVersion/_varSnapshot/marketData/idx/length/isSecondaryContext`;
 - `PineTS.prototype._snapshotVarState/_restoreVarState`;
 - PineTS's public per-field chart arrays;
 - the cache entries `{pineTS, context}`;
 - the `History` fields `v/nan/ph/pl/qh/ql/off/start/end/keep` and the deque fields `idx/val/head/saved`.
 
-Correctness **(test)**: order calls equal a full run on a broker view that changes every bar.
+Correctness **(test)**: order calls equal a full run. Two brokers are used:
+- `moving`: equity and netprofit change every bar; always flat.
+- **scripted**: the per-bar read-backs PineTS's own emulator gave the script in a full run with every order forwarded (`recordEmulatorViews`).
+
+The scripted broker opens and closes real positions. For KyberSwing over 8,508 bars that is 68 opens and 68 closes, with 2,078 bars in position and 665 bar-to-bar moves of the trailing stop. So the `position_size > 0 and position_size[1] > 0` ratchet and the exits run under trimming.
 
 | Script | Bounds | Bars stepped (after warm-up) | Result |
 |---|---|---|---|
 | probe 01 | keep 200 | 3,000 (warm-up 500) | = full run over 3,500 |
 | KyberSwing | keep 100, daily 50 | 8,008 (warm-up 500) | = full run over 8,508 |
 | KyberSwing | keep 60 + slack 20, daily 10 | 8,008 | = full run over 8,508 |
+| **KyberSwing, scripted broker (real positions)** | keep 60 + slack 20, daily 10 | 8,008 | = full run over 8,508 (17,085 calls) |
+| **KyberSwing, scripted broker** | keep 30 + slack 5, daily 10 | 3,500 | = full run over 4,000 |
+| **probe 01, scripted broker** (>1,000 bars in position) | keep 200 | 3,000 | = full run over 3,500 |
+| user function with `src[n]` and `d[1]` (lctx buffers) | keep 20 + slack 10 | 2,700 | = full run over 3,000 |
 | KyberSwing, 2 instances on one SharedScript, different brokers | keep 200 | 3,000 | each = its own full run |
 | KyberSwing untrimmed (incremental daily via the fixed updateTail) | none | 3,000 | = full run |
 | probe 05 daily values (lookahead_on `close[1]`, default `close`, tuple) | keep 50 | 1,100, checked every bar | = full run on every bar |
 
 Further tests **(test)**:
-- With trimming, the main and daily buffers, the ta histories (≤ 512 slots), the deques, alerts and the store all stay bounded, and `marketData[0]` / `marketData[last]` stay readable.
+- With trimming, these stay bounded: the main and daily buffers, the user-function (`lctx`) buffers (≤ keep + slack + 1), plot data (≤ 8 entries), the ta histories (≤ 512 slots), the deques, alerts and the store. `marketData[0]` and `marketData[last]` stay readable.
+- `barstate` after each `step()`: `islast` and `isrealtime` are true, `ishistory` is false and `isconfirmed` is true. In a full run, `islast` is true on the last bar only. So KyberSwing's `if barstate.islast` table block runs on every stepped bar, and its cost is inside the benched step time.
 - **The bound must cover the script's series lookbacks.** A script using `close[50]` matches the full run with keep 60 and diverges with keep 30.
-- KyberSwing itself matches even at keep 30. Its 55-bar windows live in taState, and its series lookbacks are `[1]`. The bound that matters is the largest `x[n]` history reference, not the ta lengths.
+- KyberSwing itself matches even at keep 30, with the scripted broker. Its 55-bar windows live in taState, and its series lookbacks are `[1]`. The bound that matters is the largest `x[n]` history reference, not the ta lengths.
 - Not tested: a ta function first called late, after trimming. Its one-time backfill reads up to 5,000 bars of its source series, so it could see fewer bars than in a full run.
 
 ### 2b.2 Memory per resident instance (bench)
@@ -427,6 +438,9 @@ The bench runs 50 KyberSwing instances in one process with one shared store and 
 warm-started on 500 bars, then stepped in lockstep. Heap is measured with `process.memoryUsage().heapUsed`
 after `global.gc()` (`--expose-gc`) every 100 passes, minus the baseline taken after the store
 and script were built. Each row gives the min-max in steady state.
+
+This is JS **heap used**, not process memory. In an isolate the process RSS per instance is about
+2x this (V8 heap headroom, ArrayBuffers, native memory): see 2b.4, where the budget figures come from.
 
 | Bounds | Windows, Node 24.19 | Linux `node:24-bookworm`, 1 CPU, 768 MB, Node 24.22 |
 |---|---|---|
@@ -445,61 +459,150 @@ Where the ~0.45 MB goes (tight bounds, freeing one component at a time from all 
 | main data series | ~18 |
 | daily buffers | ~17 |
 | plots | ~7 |
+| daily ta state | ~0.2 |
+| main chart arrays (SlidingArray) | ~0 (measured −0.4: noise) |
 
 About 240 KB is fixed cost: PineTS builds every namespace (ta, strategy, array, map, drawing
 helpers, ...) as closures per Context, and KyberSwing has two Contexts.
 
 ### 2b.3 Pass time (bench)
 
-One pass = append one bar to the store, then step every instance (median over 500 passes).
+One pass = append one bar to the store(s), then step every instance. Statistics:
+- the Node bench (`resident-bench.ts`) reports the **median** of 500 passes;
+- `resident-isolate.ts` reports the **mean** (total time / passes / instances);
+- `layout-bench.ts` (2b.4) reports mean, median, p95, p99 and max.
 
 | Where | ms per instance per bar | 2,500 instances, one core |
 |---|---|---|
 | Windows, Node, 50 instances | 0.41-0.45 (tight), 0.42-0.45 (default), 0.37 (untrimmed) | ~1.1 s |
 | Linux 1 CPU, Node, 50 instances | 0.71-0.83 (tight), ~1.0 (default) | ~2.0-2.5 s |
-| Linux 1 CPU, one isolate, 50 instances | 1.33 (tight), 1.35 (default) | ~3.3 s |
-| Linux 1 CPU, one isolate, **1,000** instances near its 512 MB limit | 3.87 | ~9.7 s (GC pressure) |
+| Linux 1 CPU, one isolate, 50 instances (mean) | 1.33 (tight), 1.35 (default) | ~3.3 s |
+| Linux 1 CPU, one isolate, **1,000** instances near its 512 MB limit, 200 steps (mean) | 3.87 | ~9.7 s. Attributed to GC pressure: inferred, not tested |
+
+These rows are extrapolated from 50 instances. The measured 500-instance passes (with mean, p95
+and max) are in 2b.4.
 
 Trimming adds ~15% to the step cost. The step cost is flat per bar.
 
-The 4h fixture was used for all of this. The cost per step does not depend on the chart
-timeframe, but **a 15m chart was not run.** Its daily context gets 96 chart bars per daily bar,
+The 4h fixture was used for all of this. The cost per step is expected not to depend on the chart
+timeframe, but that is **unmeasured: a 15m chart was not run.** Its daily context gets 96 chart bars per daily bar,
 and updateTail re-executes the developing day every bar, as it does here.
 
 ### 2b.4 Isolate layout (bench, Linux container)
 
+**Earlier, simpler runs** (`resident-isolate.ts`):
+- one shared store;
+- flat broker;
+- RSS is the delta after the host process was loaded.
+
 | Layout | Heap | Process RSS |
 |---|---|---|
 | One isolate per instance (10 isolates × 1 tight instance) | 6.4 MB used per isolate | +10.3 MB per isolate. **2,500 → ~25 GB. No.** |
-| One isolate, 50 tight instances (limit 256 MB) | 28.8 MB used / 44.3 MB total: 6.8 MB base (bundle + store + script) + 0.45 MB per instance | +122 MB for the whole run |
-| One isolate, 50 default-bound instances | 41.2 MB used / 65.6 MB total (0.69 MB per instance) | +147 MB |
-| One isolate, **1,000** tight instances (limit 512 MB, container 768 MB) | 393.5 MB used / 473.7 MB total (0.39-0.40 MB per instance) | +587 MB |
+| One isolate, 50 tight instances (limit 256 MB) | 28.8 MB used / 44.3 MB total | +122 MB |
+| One isolate, 1,000 tight instances (limit 512 MB), 200 steps | 393.5 MB used / 473.7 MB total | +587 MB |
 
-Per-instance heap is the same inside an isolate as in plain Node. The isolate itself costs
-~2 MB (bundle) plus ~5 MB (store and script), and V8 runs at total ≈ 1.2-1.5 × used.
-`gc()` is available inside isolates when Node runs with `--expose-gc`.
+**The recommended layout, measured** (`layout-bench.ts` via `docker-layout.sh`; `node:24-bookworm`,
+`--cpus 1 --memory 768m --memory-swap 768m`, i.e. no swap). Setup:
+- KyberSwing at tight bounds (keep 60 + slack 20, daily 10), each instance on its own `FeedStore` (one store per pair, as in production);
+- the scripted broker (real positions);
+- warm start on 500 bars, then lockstep passes;
+- `rssMB` is the absolute RSS of the whole Node process.
+
+The host part of that process, before any isolate, was 87-104 MB: Node itself (a bare `node -e`
+is 44 MB) plus tsx/esbuild, the fixture and the recorded views. cgroup `memory.current` also counts
+page cache (the `npm ci` files), so RSS is the figure to use.
+
+| Run | Isolates × instances | Passes | Final RSS | Isolate heap (used / total / ArrayBuffer external) | Pass time: mean / median / p95 / p99 / max | ms per instance per bar (mean) |
+|---|---|---|---|---|---|---|
+| A | 5 × 100 | 100 | 753 MB | 49.6 / 67-73 MB each | 896 / 883 / 1,208 / 1,550 / 1,550 ms | 1.79 |
+| A | 1 × 500 | 100 | 618 MB | 218.8 / 311.1 MB | 804 / 882 / 1,158 / 1,356 / 1,356 ms | 1.61 |
+| B (`MALLOC_ARENA_MAX=2`) | 5 × 100 | 100 | 672 MB | 49.6 / 70-73 MB each | 944 / 934 / 1,300 / 1,468 / 1,468 ms | 1.89 |
+| B (`MALLOC_ARENA_MAX=2`) | 1 × 500 | 100 | 547 MB | 218.6 / 324.7 MB | 752 / 791 / 1,306 / 1,446 / 1,446 ms | 1.50 |
+| **C (`MALLOC_ARENA_MAX=2`)** | **5 × 100** | **1,000** | **683 MB** | 49.6 / 67-77 / 13.2 MB each | **735 / 719 / 1,004 / 1,134 / 1,355 ms** | **1.47** |
+| **C (`MALLOC_ARENA_MAX=2`)** | **1 × 500** | **1,000** | **582 MB** | 217.7 / 333.6 / 62.4 MB | **797 / 883 / 1,174 / 1,561 / 1,688 ms** | **1.59** |
+| swap allowed (`--memory 768m` only) | 5 × 150 | 100 | 752 MB, at the cgroup limit | 70.7 / 101-110 MB each | mean 1,509, p99 / max 7,280 ms | 2.01 |
+| swap allowed | 5 × 200 | — | 744 MB after setup | 85.6 / ~100 MB each | **no pass finished in > 6 min** (CPU ~26%, thrashing); killed | — |
+
+**Where the RSS beyond the JS heap goes.** For one isolate holding 100 instances after 1,000
+passes (run C), RSS is ≈ (683 − 104) / 5 ≈ 116 MB:
+- V8 heap **total** ≈ 72 MB. V8 keeps ~45% over the 49.6 MB used.
+- ArrayBuffer backing stores ≈ 13 MB. These are outside the heap figures; mostly the ta `History` Float64Arrays, ~0.13 MB per instance.
+- ≈ 30 MB of native memory outside the V8 statistics: the allocator plus V8/isolated-vm structures per isolate.
+
+`MALLOC_ARENA_MAX=2` cut RSS by 70-80 MB in both layouts (A vs B), so a large part of that is
+glibc arena fragmentation. The 1 × 500 vs 5 × 100 difference (same 500 instances, run C: 582 vs
+683 MB) puts **~25 MB of RSS on each extra isolate**. This is the "fixed ~100 MB" the review
+asked about: in the earlier 50-instance run it was V8 heap headroom, external buffers and native
+memory, which this table now separates.
+
+The pass time grows with instances held only mildly: 1.33 ms (50, mean) → 1.47-1.59 ms (500 with
+heap headroom). The 3.87 ms at 1,000 instances in a 512 MB isolate is attributed to GC near the
+limit. That is **inferred**: the runs with headroom are faster, but GC time was not measured
+separately.
 
 ### 2b.5 Verdict
 
-Budget: 768 MB minus ~200 MB for the app, feeds and SQLite leaves ~568 MB for the engine.
-Measured end to end, 1,000 tight instances in one isolate cost **+587 MB RSS** (heap total 474 MB),
-which is already over 568 MB. Process RSS per resident instance is ~0.55-0.6 MB once V8 headroom
-and the isolate are counted (default bounds: ~0.85-0.9 MB).
+**What the 200 MB reserve has to cover.** The host Node process: Node itself (~44 MB bare), the
+app server, the market-data feeds, the broker/ledger, SQLite (page cache and connections), plus
+headroom. The bench host (~90-104 MB, including tsx, fixtures and views) is a stand-in. The real
+app's footprint is **not measured**; if it exceeds 200 MB, the engine budget shrinks with it.
+**The engine (the isolates) then gets 768 − 200 = 568 MB of RSS.**
 
-- **Fits in 768 MB:** about **850-900** KyberSwing instances with tight bounds, or about **550-600** with the safer default bounds, leaving no GC headroom. Plan on ~800 / ~500.
-- **2,500 does not fit.** It needs ~1.4-1.5 GB for the engine at tight bounds (~2.2 GB at default bounds), so a container of about **1.75 GB** (tight) or 2.5 GB (default), with 200 MB for the rest. Alternatively, cap the load at ~800 instances (for example 5 runs × 160 pairs, or fewer runs).
-- **Pass time is fine** at those sizes: ~3.3 s for 2,500 instances in isolates on one Linux core, if the heap is not at its limit. Near the limit, GC triples the cost (3.9 ms per instance per bar at 1,000 in 512 MB). Give each isolate ~30% headroom.
+**Derived from run C** (engine RSS = final RSS − host part before the first isolate):
+- 1 isolate × 500: 582 − 101 = **481 MB → 0.96 MB per instance**, isolate overhead included.
+- 5 isolates × 100: 683 − 104 = **579 MB → 1.16 MB per instance**.
+- An extra isolate costs ≈ (579 − 481) / 4 ≈ **25 MB**.
+- Model: engine ≈ isolates × 25 MB + instances × 0.92 MB. It fits both points within ±5 MB.
 
-**Recommendation.** Keep instances resident, with bounded history:
-- **Use one isolate per run**, limit ≈ 1.3 × (7 MB + instances × 0.45 MB); for example, 500 tight instances → ~300 MB.
-- **Size the bound per script:** keep = largest series history reference + margin, min ~50; daily keep likewise. Use our own static scan of `x[n]` indexes, fall back to a safe default (100 / 50) when lengths are dynamic, and reject `max_bars_back` above our cap.
-- **Then choose one of:**
-  - (a) give the container ~1.75 GB for 2,500;
-  - (b) cap at ~800 instances in 768 MB;
-  - (c) cut the fixed ~240 KB per instance, which is now the largest part.
+**Fit in 768 MB with 200 MB reserved (568 MB engine):**
+- 5 run isolates: (568 − 5 × 25) / 0.92 ≈ **480 instances** (~95 per run). The measured 5 × 100 = 500 needs 579 MB, 11 MB over.
+- 1 isolate: (568 − 25) / 0.92 ≈ **590 instances**.
+- These have no extra headroom. Plan on **~450 (5 runs × 90)**.
 
-  For (c), there are two levers. One is to share the daily `request.security` context between instances with the same script, inputs and symbol: the 5 runs on one pair could share one, saving ~120 KB each, but this is untested. The other is to patch PineTS so namespaces are built once per isolate, not per Context (a fork).
-- Rebuild-per-pass (Task 2) stays the restart path. A warm start of 500 bars takes 75-120 ms per instance; with a lookback-sized window it would be faster.
+**2,500 instances:**
+- engine ≈ 5 × 25 + 2,500 × 0.92 ≈ **2.4 GB**;
+- plus 200 MB reserve: **≈ 2.6 GB**;
+- with ~15% headroom for GC and growth: **a 3 GB container**. These are tight bounds; the default bounds (keep 100 / daily 50) need ~1.5× the per-instance heap.
+
+Alternatively, keep 768 MB and **cap the load at ~450 instances**.
+
+**Pass time:**
+- 2,500 instances, extrapolated linearly from the 500-instance runs (1.47-1.59 ms per instance per bar): **mean ~3.7-4.0 s**.
+- Worst case from the observed max pass (1,355-1,688 ms per 500): **~6.8-8.4 s**. Inside 10 s, but only with heap headroom. At 1,000 instances in an isolate near its limit, the mean alone was 3.87 ms/instance-bar (≈ 9.7 s per 2,500).
+- Not measured at 2,500 itself (it does not fit in this container).
+- With a 3 GB container, give each run isolate a limit of ~1.5 × its expected heap total. A run of 500 tight instances holds ~220 MB used / ~335 MB total, so a limit of ~500 MB.
+
+**Recommendation:**
+- Keep instances resident, with bounded history.
+- Use one isolate per run.
+- Set `MALLOC_ARENA_MAX=2` in the container.
+- Either provision **~3 GB** for 2,500 KyberSwing-sized instances, or **cap at ~450** in 768 MB.
+- To get more into the same memory, reduce the fixed ~240 KB of PineTS Contexts per instance: share daily contexts across runs (untested), or patch/fork PineTS.
+- Restart: see 2b.6.
+
+### 2b.6 Restart
+
+A restart rebuilds every resident instance with a warm start. Task 2's evidence sets the window,
+not the script's lookback. A window only as long as the lookback is **not** enough: EMA and other
+recursive state must converge from the window start.
+- KyberSwing reproduced 13/13 entries with a 3,000-bar window, 9-11/13 with 2,000 bars and 3/13 with 1,000 bars (Q4 table). That test used the flat broker; the window also has to start before the oldest open trade's entry.
+- So the restart window is **~3,000 bars** for KyberSwing. That costs ~0.33 s per instance on Windows (bench): **2,500 × 0.33 s ≈ 14 min**.
+- Linux 1-CPU warm starts measured 107-118 ms for 500 bars, so expect ~0.6-0.7 s for 3,000 bars: **≈ 25-30 min for 2,500 (estimate)**.
+- During that time the instances are not ready. The engine must either delay trading until all are warm, or warm in priority order. No shorter-window restart has been shown to be exact.
+
+### 2b.7 Open items (untested)
+
+- **Deriving `keep` / `htfKeep` per script.** The static scan of `x[n]` history references has to handle:
+  - `x[bar_index - k]` and other runtime offsets, and offsets from inputs;
+  - lookbacks inside user functions (`lctx` buffers are trimmed with the same bound);
+  - ta functions with a dynamic length that grows after `shrinkHistory` (the next `keepFor` raises `keep` again, but the dropped entries are gone);
+  - lookbacks inside `request.security` expressions vs `htfKeep`.
+
+  Until that exists, use a safe default and reject scripts whose references cannot be bounded.
+- A ta function first called after trimming: its one-time backfill would see fewer source bars.
+- `SharedScript.pending` hands a new run's context to the instance being created. This assumes `ResidentInstance.create()` calls never overlap (await them one at a time). Task 5 must keep that, or bind contexts another way.
+- Sharing one daily `request.security` context between instances with the same script, inputs and symbol.
+- 15m charts; scripts with several `request.security` calls or other timeframes.
 
 ## State persistence recommendation
 
