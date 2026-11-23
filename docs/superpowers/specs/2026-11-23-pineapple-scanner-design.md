@@ -21,10 +21,10 @@ The owner wants to paste any Pine `strategy()` script, often one from the Tradin
 
 ## Constraints
 
-- **Shared server.** Another production app runs on the same host. Pineapple gets a hard cap: Docker `mem_limit` 768 MB and `cpus` 1.0 by default, both set in `.env`. It must run normally inside that cap with the default limit of 5 runs.
+- **Shared server.** Another production app runs on the same host. Pineapple gets a hard cap: Docker `mem_limit` 768 MB and `cpus` 1.0 by default, both set in `.env`. It must run normally inside that cap with the default limit of **1 run** (owner decision, 2026-11-24, from the Task 2b measurements: about 125 MB base plus about 0.5 GB per 500-pair run; 768 MB fits 1 run). The run limit is derived from the configured memory cap, so raising `mem_limit` raises the limit, at about 0.5 GB per extra run.
 - **Access only through a tunnel.** The HTTP server listens only on `127.0.0.1` (compose maps `127.0.0.1:${PORT}:${PORT}`). The owner reaches it through a tunnel of their choice (Cloudflare Tunnel, Tailscale or SSH forward). The tunnel provides HTTPS, so the app does not manage TLS certificates.
 - **Outbound only to Binance.** The app contacts Binance. Binance never contacts the app.
-- **Smallest timeframe is 15m.** The wizard offers 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h and 1d. Sizing and performance targets assume 15m is the worst case: 5 runs × all pairs, a pass every 15 minutes.
+- **Smallest timeframe is 15m.** The wizard offers 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h and 1d. Sizing and performance targets assume 15m is the worst case: the run limit × all pairs, a pass every 15 minutes. Measured: about 1.5 ms per script per bar, so a 500-pair pass takes about 0.8 s.
 - **Binance is reachable.** The owner ran `fapi.binance.com/fapi/v1/ping` from the server on 2026-11-23 and got 200.
 - **Fixed amount per trade is position size (notional), not margin.** For example, "$100" at 10x is a $100 position holding $10 margin.
 - **The script arrives after login.** It is pasted in the wizard. No script ships with the app.
@@ -82,7 +82,8 @@ A single Node 24 process inside one container:
   - Two all-market streams cover live prices: last price (`!ticker@arr`) for stops and limits, and mark price (`!markPrice@arr@1s`) for liquidation and open P&L. There is no per-pair price socket.
 - **History:** loaded gradually when a run starts and kept within 50% of Binance's REST weight budget. Each pair keeps only the candles its warm-up needs in memory. Older candles live in SQLite.
 - **Sharing:** runs on the same timeframe share the candle cache and the feed. Each run has its own script instances and broker state.
-- **Budget:** idle memory target under 250 MB. The default load is 5 runs × all pairs on 4h.
+- **Budget:** about 125 MB base, plus about 0.92 MB per resident script and about 25 MB per run isolate (Task 2b, measured in a Linux container). The default load is 1 run × all pairs.
+- **Script state:** resident PineTS instances step one bar at a time with bounded history (see `docs/spike/pinets-findings.md`, Task 2b). A restart warm-starts each instance on about 3,000 bars (about 5–6 minutes for 500 pairs, estimated). The window must start before the oldest open trade's entry.
 
 ### Correctness and replay
 

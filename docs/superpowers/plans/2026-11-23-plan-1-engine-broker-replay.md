@@ -257,11 +257,35 @@ The findings doc must answer each of these with a yes/no and a code snippet:
     - `constructor(decl: StrategyDeclaration, broker: PaperBroker, symbol: string, sizing: SizingRule)`
     - `toIntents(calls: PineOrderCall[], bar: Candle): OrderIntent[]` (pyramiding, reversal, brackets/OCA, FIFO exits, qty from `defaultQty*` against broker equity)
     - `scriptView(): ScriptView`, where `ScriptView = { positionSize: number; positionAvgPrice: number; equity: number; openTrades: number; netProfit: number }`
-  - `class PineInstance`:
-    - `static create(source: string, symbol: string, tf: Timeframe, warmup: Candle[], view: () => ScriptView): Promise<PineInstance>`
-    - `step(bar: Candle): Promise<PineOrderCall[]>`
-    - `warmupBars(): number`
-- **Warm-up runs flat:** order calls returned during warm-up are discarded.
+  - `runStrategy(o: { source: string; symbol: string; tf: Timeframe; candles: Candle[]; syminfo: { mintick: number; qtyStep: number }; hooks: BarHooks }): Promise<void>`, where `BarHooks = { before(bar: Candle, idx: number): ScriptView; after(bar: Candle, idx: number, calls: PineOrderCall[]): void }`. This is the full-history driver Task 6's replay uses. Live stepping with bounded history (spike Task 2b) belongs to Plan 2. Build nothing for it here beyond keeping the hook code reusable.
+  - `ScriptView` also carries `opentrades` details: `{ size; entryPrice; entryId; entryBarIndex; entryTime; profit }[]`, plus `openProfit`.
+
+**Hook design (approved, from `docs/spike/pinets-findings.md`, section "Recommended hook design for Task 5"; read it first):**
+- **Compile and wrap.** Compile with `new Indicator(src).prepare()`, then wrap `prepared.fn` and keep `_pineVersion` and `_ltfSlices` on the wrapper.
+- **Each bar:**
+  - Skip secondary contexts.
+  - Call `hooks.before` and feed its view through replaced getters: `position_size`, `position_avg_price`, `equity`, `netprofit`, `openprofit`, `opentrades`.
+  - Run the original.
+  - Pass the captured calls (`entry`, `exit`, `close`, `close_all`, `order`, `cancel`, `cancel_all`, normalised to Pine v6 signatures) to `hooks.after`. Never forward them to PineTS's emulator.
+- **Data comes from an in-memory provider.**
+  - `syminfo` carries the pair's mintick and qty step.
+  - Daily and other higher-timeframe candles are built from the stored candles.
+  - Never use `Provider.Binance` or a network import resolver.
+- **Move the spike code into `src/engine/`.** Take the hook core (`spike/hook-core.ts`, `normaliseOrderArgs`) and keep a single source. The spike may then import from `src/engine/`.
+
+**Validation (`compileScript`) rejects, each with a clear message:**
+- `indicator()` / `library()`;
+- `calc_on_order_fills = true`;
+- any `strategy.*` read-back the view doesn't feed, such as `closedtrades.*`, `wintrades`, `grossprofit`, `max_drawdown` or `position_entry_name`. Message: `strategy.<name> is not supported in v1`.
+
+Unknown functions only fail when the script runs. So `compileScript` also runs the script on 300 bars of fixture candles with a flat view and reports runtime errors; use the Pine line where PineTS gives one, otherwise line 0.
+
+**Controller rulings carried in:**
+- **Margin to leverage.**
+  - The layer passes `leverageInForce(marginPct, rules.maxLeverage)` into each intent.
+  - A declared `margin_long` / `margin_short` of `0` (no margin checking in Pine) maps to `rules.maxLeverage`.
+- **Exit orders belong to the strategy layer.** A `strategy.exit` tied to a `from_entry` that hasn't filled yet stays pending in the layer. It is submitted to the broker only once that entry has filled, so the broker's purge of orphan exits can't drop it.
+- **Warm-up is flat.** For bars before `from`, `before` returns a flat view with the starting equity, and `after` discards the calls.
 
 - [ ] **Step 1: Write failing tests:**
   - `opposite entry reverses position`: long 1, then `entry('S', short, qty 1)` gives one sell intent of qty 2.
@@ -274,6 +298,11 @@ The findings doc must answer each of these with a yes/no and a code snippet:
   - `compileScript rejects indicator with exact message`.
   - `compileScript reports unsupported function with line number` (probe 07).
   - `warm-up orders are discarded`.
+  - `pending exit survives until its entry fills`: a limit entry with a stop and take-profit exit. Price touches the take-profit first, then a later bar fills the entry, and the exit is live at the broker.
+  - `margin 0 maps to pair max leverage`.
+  - `compileScript rejects unfed read-back`: a script reading `strategy.wintrades` gets the exact message.
+  - `compileScript rejects calc_on_order_fills`.
+  - `runStrategy hooks match spike capture`: KyberSwing on the fixture with PineTS's own fills replayed as the view (spike `recordEmulatorViews`) gives order calls equal to the spike's recorded calls.
 - [ ] **Step 2: Run to verify they fail.** Run `npx vitest run tests/engine`. Expected: FAIL.
 - [ ] **Step 3: Implement** both files using the approved hook design.
 - [ ] **Step 4: Run to verify they pass.** Expected: PASS.
@@ -288,7 +317,7 @@ The findings doc must answer each of these with a yes/no and a code snippet:
 - Test: `tests/engine/replay.test.ts`, `tests/report/summary.test.ts`
 
 **Interfaces:**
-- Consumes: `PineInstance`, `StrategyLayer`, `PaperBroker`, `loadCandles`, `loadFunding`.
+- Consumes: `runStrategy` and `BarHooks`, `StrategyLayer`, `PaperBroker`, `loadCandles`, `loadFunding`.
 - Produces:
   - `TvProperties { initialCapital: number; commissionPct: number; slippageTicks: number }`
   - `replay(o: { source: string; symbol: string; tf: Timeframe; candles: Candle[]; funding: FundingEvent[]; from: number; to: number; mode: BrokerMode; tv?: TvProperties; rules: PairRules; fees?: FeeConfig; startingBalance: number; sizing: SizingRule }): Promise<{ trades: ClosedTrade[]; equityCurve: { time: number; equity: number }[]; summary: Summary }>`
@@ -296,15 +325,19 @@ The findings doc must answer each of these with a yes/no and a code snippet:
   - CLI: `npx tsx src/cli/replay.ts --script <file> --symbol BTCUSDT --tf 4h --from 2024-01-01 --to 2026-11-18 --mode tradingview --tv '{"initialCapital":10000,"commissionPct":0.05,"slippageTicks":0}'` prints the summary table and writes `results/<name>-trades.csv`.
 
 **Order of events for each bar `b` in [from, to] (spec: fill at the next bar's open):**
+Inside `hooks.before(b)`:
 1. `broker.onBarOpen(b)`
-2. Apply funding events with `b.openTime ≤ t < b.openTime + tf`
-3. `broker.onBarRange(b)`
-4. `broker.markToMarket(b.close)`, and `onMark(b.close)` in `binance` mode
-5. `calls = await instance.step(b)`
-6. `layer.toIntents(calls, b)`
-7. `broker.submit` each intent
+2. Apply funding events with `b.openTime ≤ t < b.openTime + tf`. When `markPrice` is 0, the broker substitutes the last price.
+3. `binance` mode only: `broker.onMark` at the bar's adverse extreme (low for a long, high for a short), applied in path order with `onBarRange`. Liquidation wins only if the liquidation price is reached before the stop on the intrabar path (`|H−O| < |O−L|` → O→H→L→C, else O→L→H→C).
+4. `broker.onBarRange(b)`
+5. `broker.markToMarket(b.close)`
+6. Return `layer.scriptView()`.
 
-Bars before `from` are warm-up.
+Inside `hooks.after(b, calls)`:
+1. `layer.toIntents(calls, b)`
+2. `broker.submit` each intent, logging rejections.
+
+Bars before `from` are warm-up (flat view, calls discarded). Slippage in `tradingview` mode is `slippageTicks × mintick` per market fill.
 
 - [ ] **Step 1: Write failing tests:**
   - `summary of known trades`: pnls `[100, −50, 200, −25]` give winRate 50, PF `300/75 = 4`, biggestWin 200, biggestLoss −25.
@@ -333,7 +366,7 @@ Bars before `from` are warm-up.
     - |winRatePct − ref| ≤ 3
     - |profitFactor − ref| ≤ 0.15
     - |netProfitPct − ref| ≤ 3
-  - Add a `kyber-swing` entry: `trades 58, winRatePct 32.8, profitFactor 1.71, netProfitPct 22.6`, script path `tests/fixtures/KyberSwing.pine`. Run it with `it.skipIf(!exists)` until the owner provides the script and its TV Properties.
+  - The `kyber-swing` entry (`trades 58, winRatePct 32.8, profitFactor 1.71, netProfitPct 22.6`, script `tests/fixtures/KyberSwing.pine`) is a required test. The owner supplied it, and its Properties come from its own declaration: capital 10000, commission 0.05%, slippage 2 ticks, margin 20. `ma-cross` stays `it.skipIf(ref === null)`.
 - [ ] **Step 2: Write `mtf.test.ts`** with probe 05:
   - The daily regime the script sees on every 4h bar equals the regime computed by hand from the previous closed daily candle (daily candles built from the 4h fixture).
   - No 4h bar ever sees the current day's unclosed daily close.
