@@ -5,6 +5,9 @@ import type { IProvider, ISymbolInfo, Kline } from 'pinets';
 import type { Candle, Timeframe } from '../core/types.js';
 import { tfToMs } from '../core/timeframe.js';
 
+/** Raised by MemoryProvider (and shown to the user) for a request.security call on another symbol. */
+export const OTHER_SYMBOL_MESSAGE = 'request.security on another symbol is not supported in v1';
+
 const MIN = 60_000;
 const DAY = 86_400_000;
 
@@ -162,7 +165,15 @@ export class MemoryProvider implements IProvider {
     return rows;
   }
 
-  async getMarketData(_tickerId: string, timeframe: string, limit?: number, sDate?: number, eDate?: number): Promise<Kline[]> {
+  /** Whether a request.security symbol is the chart's own (syminfo.tickerid, bare, BINANCE:SYM or BINANCE:SYM.P). */
+  private isChartSymbol(tickerId: string): boolean {
+    const root = String((this.info as unknown as { root?: string }).root ?? '').toUpperCase();
+    const id = String(tickerId).toUpperCase().replace(/^BINANCE:/, '').replace(/\.P$/, '');
+    return root !== '' && id === root;
+  }
+
+  async getMarketData(tickerId: string, timeframe: string, limit?: number, sDate?: number, eDate?: number): Promise<Kline[]> {
+    if (!this.isChartSymbol(tickerId)) throw new Error(OTHER_SYMBOL_MESSAGE);
     let rows = this.series(timeframe).filter(
       (k) => (sDate === undefined || k.openTime >= sDate) && (eDate === undefined || k.openTime < eDate),
     );

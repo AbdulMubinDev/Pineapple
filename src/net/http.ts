@@ -27,6 +27,8 @@ export async function httpGetJson<T>(url: string, opts: { timeoutMs?: number } =
   const parsed = assertAllowed(url);
   const res = await fetch(parsed, {
     method: 'GET',
+    // A redirect could leave the allowlist; fail instead of following it.
+    redirect: 'error',
     headers: { accept: 'application/json' },
     signal: AbortSignal.timeout(opts.timeoutMs ?? 15_000),
   });

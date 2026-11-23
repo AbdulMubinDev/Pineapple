@@ -40,3 +40,11 @@ describe('httpGetJson', () => {
     await expect(httpGetJson('https://fapi.binance.com/x')).rejects.toThrow(/418/);
   });
 });
+
+describe("httpGetJson redirects", () => {
+  it("passes redirect: error so a redirect cannot leave the allowlist", async () => {
+    const spy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+    await httpGetJson("https://fapi.binance.com/x");
+    expect(spy.mock.calls[0]![1]).toMatchObject({ redirect: "error" });
+  });
+});

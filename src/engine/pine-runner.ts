@@ -26,7 +26,7 @@ import {
   type BrokerView,
   type OrderMethod,
 } from './hook-core.js';
-import { MemoryProvider, perpSymbolInfo, pineTimeframe } from './memory-provider.js';
+import { MemoryProvider, OTHER_SYMBOL_MESSAGE, perpSymbolInfo, pineTimeframe } from './memory-provider.js';
 import type { ScriptView } from './strategy-layer.js';
 
 /** One strategy.* order call, normalised to the Pine v6 signature. Absent and `na` arguments are omitted. */
@@ -60,7 +60,8 @@ export interface StrategyDeclaration {
 }
 
 export type CompileError = { line: number; message: string };
-export type CompileResult = { ok: true; declaration: StrategyDeclaration } | { ok: false; errors: CompileError[] };
+export type CompileWarning = { line: number; message: string };
+export type CompileResult = { ok: true; declaration: StrategyDeclaration; warnings?: CompileWarning[] } | { ok: false; errors: CompileError[] };
 
 export interface BarHooks {
   before(bar: Candle, idx: number): ScriptView;
@@ -201,8 +202,8 @@ export async function runStrategy(o: RunOptions): Promise<void> {
 
 // ------------------------------------------------------------------ validation ----
 
-/** The source with comments and string literals blanked out, line by line (positions kept). */
-function codeLines(source: string): string[] {
+/** The source with comments (and, unless `keepStrings`, string literals) blanked out, line by line (positions kept). */
+function codeLines(source: string, keepStrings = false): string[] {
   const out: string[] = [];
   for (const line of source.split(/\r?\n/)) {
     let s = '';
@@ -211,12 +212,12 @@ function codeLines(source: string): string[] {
       const ch = line[i]!;
       if (quote) {
         if (ch === '\\') {
-          s += '  ';
+          s += keepStrings ? ch + (line[i + 1] ?? '') : '  ';
           i++;
         } else if (ch === quote) {
           quote = null;
           s += ch;
-        } else s += ' ';
+        } else s += keepStrings ? ch : ' ';
       } else if (ch === '"' || ch === "'") {
         quote = ch;
         s += ch;
@@ -263,8 +264,8 @@ function unfedReadBacks(lines: string[]): CompileError[] {
   return errors;
 }
 
-/** Deterministic synthetic 4h candles for the validation run (no fixture files in src/). */
-function syntheticCandles(n: number): Candle[] {
+/** Deterministic synthetic candles at `tf` for the validation run (no fixture files in src/). */
+function syntheticCandles(n: number, tf: Timeframe): Candle[] {
   const out: Candle[] = [];
   const start = Date.UTC(2024, 0, 1);
   let seed = 12345;
@@ -276,14 +277,104 @@ function syntheticCandles(n: number): Candle[] {
     const high = Math.max(open, close) * (1 + 0.004 * (rnd() + 0.5));
     const low = Math.min(open, close) * (1 - 0.004 * (rnd() + 0.5));
     const r = (x: number) => Math.round(x * 10) / 10;
-    out.push({ openTime: start + i * tfToMs('4h'), open: r(open), high: r(high), low: r(low), close: r(close), volume: 100 + 50 * (rnd() + 0.5) });
+    out.push({ openTime: start + i * tfToMs(tf), open: r(open), high: r(high), low: r(low), close: r(close), volume: 100 + 50 * (rnd() + 0.5) });
   }
   return out;
 }
 
 const VALIDATION_BARS = 300;
 
-function errorLine(lines: string[], message: string): number {
+type SecurityCall = { line: number; text: string };
+
+/** Every request.security(...) call (comments blanked, strings kept): its first line and its text up to the closing paren. */
+function securityCalls(lines: string[]): SecurityCall[] {
+  const calls: SecurityCall[] = [];
+  lines.forEach((l, i) => {
+    for (const m of l.matchAll(/(?<![\w.])request\.security\s*\(/g)) {
+      let depth = 0;
+      let text = '';
+      let quote: string | null = null;
+      scan: for (let li = i; li < lines.length; li++) {
+        const src = li === i ? lines[li]!.slice(m.index) : lines[li]!;
+        for (let k = 0; k < src.length; k++) {
+          const ch = src[k]!;
+          text += ch;
+          if (quote) {
+            if (ch === '\\') text += src[++k] ?? '';
+            else if (ch === quote) quote = null;
+          } else if (ch === '"' || ch === "'") quote = ch;
+          else if (ch === '(') depth++;
+          else if (ch === ')' && --depth === 0) break scan;
+        }
+        text += '\n';
+      }
+      calls.push({ line: i + 1, text });
+    }
+  });
+  return calls;
+}
+
+const stringLiteral = (s: string) => /^\s*(["'])(.*)\1\s*$/s.exec(s)?.[2];
+
+/** The call's arguments as written, split at top-level commas. */
+function securityArgs(call: SecurityCall): string[] {
+  const inner = call.text.slice(call.text.indexOf('(') + 1);
+  const args: string[] = [];
+  let depth = 0;
+  let quote: string | null = null;
+  let cur = '';
+  for (let k = 0; k < inner.length; k++) {
+    const ch = inner[k]!;
+    if (quote) {
+      cur += ch;
+      if (ch === '\\') cur += inner[++k] ?? '';
+      else if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      cur += ch;
+    } else if (ch === '(' || ch === '[') {
+      depth++;
+      cur += ch;
+    } else if (ch === ')' || ch === ']') {
+      if (depth === 0) break;
+      depth--;
+      cur += ch;
+    } else if (ch === ',' && depth === 0) {
+      args.push(cur);
+      cur = '';
+    } else cur += ch;
+  }
+  args.push(cur);
+  return args;
+}
+
+/** The request.security call a MemoryProvider error belongs to, else the first call, else 0. */
+function securityErrorLine(calls: SecurityCall[], message: string): number {
+  if (calls.length === 0) return 0;
+  if (message === OTHER_SYMBOL_MESSAGE) {
+    const other = calls.find((c) => {
+      const sym = stringLiteral(securityArgs(c)[0] ?? '');
+      return sym !== undefined && !/^(?:BINANCE:)?BTCUSDT(?:\.P)?$/i.test(sym);
+    });
+    return (other ?? calls[0]!).line;
+  }
+  const tf = /cannot build (\S+) candles/.exec(message)?.[1];
+  if (tf) {
+    const hit = calls.find((c) => stringLiteral(securityArgs(c)[1] ?? '')?.toUpperCase() === tf.toUpperCase());
+    if (hit) return hit.line;
+  }
+  return calls[0]!.line;
+}
+
+/** request.security(..., lookahead_on) whose expression has no history offset: it repaints on history. */
+function lookaheadWarnings(calls: SecurityCall[]): CompileWarning[] {
+  return calls
+    .filter((c) => /(?<![\w])lookahead_on(?![\w])/.test(c.text) && !/[\w)\]]\s*\[/.test(c.text))
+    .map((c) => ({ line: c.line, message: 'request.security with lookahead_on and no [1] offset uses unclosed higher-timeframe data' }));
+}
+
+function errorLine(lines: string[], message: string, calls: SecurityCall[] = []): number {
+  if (message === OTHER_SYMBOL_MESSAGE || /^MemoryProvider /.test(message)) return securityErrorLine(calls, message);
   const pos = /\bat (\d+):\d+/.exec(message);
   if (pos) return Number(pos[1]);
   const undeclared = /^Undeclared identifier "([^"]+)"/.exec(message);
@@ -323,8 +414,9 @@ function readDeclaration(ind: Indicator): StrategyDeclaration {
  * Validates a pasted script. Async because the last check runs it (PineTS runs are async): unknown
  * functions and unsupported data requests only show up then.
  */
-export async function compileScript(source: string): Promise<CompileResult> {
+export async function compileScript(source: string, tf: Timeframe = '4h'): Promise<CompileResult> {
   const lines = codeLines(source);
+  const calls = securityCalls(codeLines(source, true));
   const fail = (errors: CompileError[]): CompileResult => ({ ok: false, errors: errors.sort((a, b) => a.line - b.line) });
 
   const ind = new Indicator(source);
@@ -371,8 +463,8 @@ export async function compileScript(source: string): Promise<CompileResult> {
     const ctx = await execute({
       source,
       symbol: 'BTCUSDT',
-      tf: '4h',
-      candles: syntheticCandles(VALIDATION_BARS),
+      tf,
+      candles: syntheticCandles(VALIDATION_BARS, tf),
       syminfo: { mintick: 0.1, qtyStep: 0.001 },
       hooks: { before: () => flat, after: () => {} },
     });
@@ -381,7 +473,9 @@ export async function compileScript(source: string): Promise<CompileResult> {
     for (const m of methods) errors.push({ line: tokenLine(lines, m), message: `${m} is not supported in v1` });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
-    errors.push({ line: errorLine(lines, message), message });
+    errors.push({ line: errorLine(lines, message, calls), message });
   }
-  return errors.length > 0 ? fail(errors) : { ok: true, declaration };
+  if (errors.length > 0) return fail(errors);
+  const warnings = lookaheadWarnings(calls);
+  return warnings.length > 0 ? { ok: true, declaration, warnings } : { ok: true, declaration };
 }

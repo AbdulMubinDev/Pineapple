@@ -36,7 +36,7 @@ Both get written after Task 2's findings are approved.
   - Money is a JS `number` in USDT. Round only for display and CSV output, to 8 dp for quantities and 2 dp for USD.
 - **Default costs** (Binance USDT-M base tier): maker `0.0002`, taker `0.0005`, slippage `0.0002` (0.02%) per market fill.
 - **Broker modes:**
-  - **`tradingview`:** no lot rounding, no min notional, no funding, no liquidation. Commission and slippage come from the supplied TV properties.
+  - **`tradingview`:** the broker skips lot rounding and min notional, and there is no funding or liquidation. The strategy layer still floors quantity to the pair's qty step in both modes, deliberately, for TradingView parity (docs/spike/pinets-findings.md). Commission and slippage come from the supplied TV properties.
   - **`binance`:** everything on.
 - **Machine load:** Vitest uses `maxWorkers: 2`, since long jobs on this machine must stay around 40–45% CPU.
 
