@@ -212,6 +212,11 @@ export class PaperBroker {
     return change;
   }
 
+  /** The last price the broker marked `symbol` at (open, path, close or tick), if any. */
+  lastPriceOf(symbol: string): number | undefined {
+    return this.lastPrice[symbol];
+  }
+
   position(symbol: string): Position | null {
     const p = this.positions[symbol];
     return p ? { ...p } : null;

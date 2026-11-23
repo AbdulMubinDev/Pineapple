@@ -12,7 +12,8 @@
 //
 // No network: PineTS is only ever given in-memory candles (an array or MemoryProvider).
 import { readFileSync } from 'node:fs';
-import { PineTS, Indicator, type Context, type IProvider, type ISymbolInfo, type Kline } from 'pinets';
+import { PineTS, Indicator, type Context, type ISymbolInfo, type Kline } from 'pinets';
+import { MemoryProvider as EngineMemoryProvider, aggregateCandles, perpSymbolInfo, toKline as engineToKline } from '../src/engine/memory-provider.js';
 import { loadCandles } from '../src/data/csv.js';
 import type { Candle } from '../src/core/types.js';
 
@@ -35,97 +36,39 @@ export function fixtureCandles(): Candle[] {
 }
 
 export function toKline(c: Candle, tfMs: number): Kline {
-  return {
-    ...c,
-    closeTime: c.openTime + tfMs,
-    quoteAssetVolume: 0,
-    numberOfTrades: 0,
-    takerBuyBaseAssetVolume: 0,
-    takerBuyQuoteAssetVolume: 0,
-    ignore: 0,
-  };
+  return engineToKline(c, c.openTime + tfMs);
 }
 
 /** UTC-day candles from 4h candles (Binance and TradingView crypto days start at 00:00 UTC). */
 export function aggregateDaily(c4h: Candle[]): Candle[] {
-  const out: Candle[] = [];
-  for (const c of c4h) {
-    const day = Math.floor(c.openTime / DAY_MS) * DAY_MS;
-    const last = out[out.length - 1];
-    if (last && last.openTime === day) {
-      last.high = Math.max(last.high, c.high);
-      last.low = Math.min(last.low, c.low);
-      last.close = c.close;
-      last.volume += c.volume;
-    } else {
-      out.push({ openTime: day, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume });
-    }
-  }
-  return out;
+  return aggregateCandles(c4h, 'D');
 }
 
 /** Symbol facts PineTS's broker uses (tick grid, qty step). Values for Binance BTCUSDT perpetual. */
-export const BTCUSDT_PERP_SYMINFO = {
-  ticker: 'BTCUSDT.P',
-  tickerid: TICKER,
-  prefix: 'BINANCE',
-  root: 'BTCUSDT',
-  description: 'BTCUSDT Perpetual',
-  type: 'crypto',
-  basecurrency: 'BTC',
-  currency: 'USDT',
-  timezone: 'Etc/UTC',
-  session: '24x7',
-  mintick: 0.1,
-  minmove: 1,
-  pricescale: 10,
-  pointvalue: 1,
-  mincontract: 0.001,
-} as unknown as ISymbolInfo;
+export const BTCUSDT_PERP_SYMINFO = perpSymbolInfo('BTCUSDT', { mintick: 0.1, qtyStep: 0.001 });
 
 /**
- * In-memory data source: serves the chart's 4h candles and daily candles aggregated from them.
- * push() grows it (bar-by-bar mode): the daily candle of the current day is then the developing
- * day built from the 4h bars seen so far, which is what TradingView shows on a realtime bar.
+ * The engine's in-memory data source (src/engine/memory-provider.ts) on the 4h fixture, with BTCUSDT
+ * perpetual symbol info, logging what PineTS asks for. push() grows it (bar-by-bar mode): the daily
+ * candle of the current day is then the developing day built from the 4h bars seen so far.
  */
-export class MemoryProvider implements IProvider {
-  private readonly c4h: Candle[];
+export class MemoryProvider extends EngineMemoryProvider {
   public readonly requests: { timeframe: string; sDate?: number; eDate?: number }[] = [];
 
-  constructor(candles4h: Candle[], private readonly info: ISymbolInfo = BTCUSDT_PERP_SYMINFO) {
-    this.c4h = candles4h.slice();
+  constructor(candles4h: Candle[], info: ISymbolInfo = BTCUSDT_PERP_SYMINFO) {
+    super(candles4h, '4h', info);
   }
 
-  push(c: Candle): void {
-    this.c4h.push(c);
-  }
-
-  async getMarketData(_tickerId: string, timeframe: string, limit?: number, sDate?: number, eDate?: number): Promise<Kline[]> {
+  override async getMarketData(tickerId: string, timeframe: string, limit?: number, sDate?: number, eDate?: number): Promise<Kline[]> {
     this.requests.push({ timeframe, sDate, eDate });
-    const tf = String(timeframe).toUpperCase();
-    const src =
-      tf === '240' || tf === '4H'
-        ? this.c4h.map((c) => toKline(c, H4_MS))
-        : tf === 'D' || tf === '1D'
-          ? aggregateDaily(this.c4h).map((c) => toKline(c, DAY_MS))
-          : null;
-    if (!src) throw new Error(`MemoryProvider has no ${timeframe} data`);
-    let rows = src.filter((k) => (sDate === undefined || k.openTime >= sDate) && (eDate === undefined || k.openTime < eDate));
-    if (limit && limit > 0) rows = rows.slice(-limit);
-    return rows.map((k) => ({ ...k }));
+    return super.getMarketData(tickerId, timeframe, limit, sDate, eDate);
   }
-
-  async getSymbolInfo(): Promise<ISymbolInfo> {
-    return this.info;
-  }
-
-  configure(): void {}
 }
 
 // ---------------------------------------------------------------- the hook ----
 
-import { SIGNATURES, normaliseOrderArgs, scalarList, type BrokerView, type OrderCall, type OrderMethod } from './hook-core.js';
-export { normaliseOrderArgs, type BrokerTrade, type BrokerView, type OrderCall, type OrderMethod } from './hook-core.js';
+import { installStrategyHooks, normaliseOrderArgs, type BrokerView, type OrderCall, type OrderMethod } from '../src/engine/hook-core.js';
+export { normaliseOrderArgs, type BrokerTrade, type BrokerView, type OrderCall, type OrderMethod } from '../src/engine/hook-core.js';
 
 export interface HookOptions {
   /** Broker state for this bar, read before the script runs on it. Omit to leave PineTS's getters. */
@@ -165,26 +108,16 @@ export function hookScript(source: string, opts: HookOptions = {}): HookedScript
   let lastBar = -1;
   let patchCount = 0;
 
-  const patch = ($: Ctx) => {
-    const ns = $.pine.strategy;
-    for (const method of Object.keys(SIGNATURES) as OrderMethod[]) {
-      const orig = ns[method]!;
-      ns[method] = (...raw: unknown[]) => {
+  const patch = ($: Ctx) =>
+    installStrategyHooks($.pine.strategy, {
+      onCall: (method: OrderMethod, raw: unknown[], orig: (...a: unknown[]) => unknown) => {
         const call: OrderCall = { bar: $.idx, time: $.marketData[$.idx]!.openTime, method, args: normaliseOrderArgs(method, raw) };
         calls.push(call);
         const fwd = typeof opts.forward === 'function' ? opts.forward(call) : opts.forward === true;
         return fwd ? orig(...raw) : undefined;
-      };
-    }
-    if (opts.broker) {
-      ns.position_size = () => view!.position_size;
-      ns.position_avg_price = () => view!.position_avg_price;
-      ns.equity = () => view!.equity;
-      ns.netprofit = () => view!.netprofit;
-      ns.openprofit = () => view!.openprofit;
-      ns.opentrades = () => scalarList(view!.opentrades);
-    }
-  };
+      },
+      view: opts.broker ? () => view! : undefined,
+    });
 
   const wrapped = async ($: Ctx) => {
     if (!$.isSecondaryContext) {

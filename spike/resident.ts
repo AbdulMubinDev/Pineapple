@@ -14,7 +14,7 @@
 //    with our fix for its rollback bug (installUpdateTailFix).
 //  - trim(): after each step, drops history beyond `keep` bars from every growing buffer.
 import { PineTS, Indicator, type Context, type IProvider, type ISymbolInfo, type Kline } from 'pinets';
-import { SIGNATURES, normaliseOrderArgs, scalarList, type BrokerView, type OrderCall, type OrderMethod } from './hook-core.js';
+import { installStrategyHooks, normaliseOrderArgs, type BrokerView, type OrderCall, type OrderMethod } from '../src/engine/hook-core.js';
 
 export const H4_MS = 14_400_000;
 export const DAY_MS = 86_400_000;
@@ -508,19 +508,13 @@ export class ResidentInstance {
 
   attach($: Ctx): void {
     this.ctx = $;
-    const ns = $.pine.strategy;
-    for (const method of Object.keys(SIGNATURES) as OrderMethod[]) {
-      ns[method] = (...raw: unknown[]) => {
+    installStrategyHooks($.pine.strategy, {
+      onCall: (method: OrderMethod, raw: unknown[]) => {
         this.calls.push({ bar: $.idx, time: $.marketData[$.idx]!.openTime, method, args: normaliseOrderArgs(method, raw) });
         return undefined;
-      };
-    }
-    ns.position_size = () => this.view!.position_size;
-    ns.position_avg_price = () => this.view!.position_avg_price;
-    ns.equity = () => this.view!.equity;
-    ns.netprofit = () => this.view!.netprofit;
-    ns.openprofit = () => this.view!.openprofit;
-    ns.opentrades = () => scalarList(this.view!.opentrades);
+      },
+      view: () => this.view!,
+    });
     // Only closed bars are stepped: confirmed. (PineTS reads closeTime.data[idx] absolutely here.)
     Object.defineProperty($.pine.barstate, 'isconfirmed', { get: () => true, configurable: true });
   }

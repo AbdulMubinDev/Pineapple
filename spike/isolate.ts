@@ -4,6 +4,8 @@
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { build } from 'esbuild';
 import ivm from 'isolated-vm';
 import type { Candle } from '../src/core/types.js';
 
@@ -25,55 +27,32 @@ export function pinetsBrowserBundle(): string {
   return readFileSync(join(dirname(main), 'pinets.min.browser.js'), 'utf8');
 }
 
-// The Q1/Q2 hook as plain JS for inside the isolate (same logic as hookScript/normaliseOrderArgs in
-// probe.ts; the Q7 test checks both produce the same calls). The broker stays in the host and is
-// called once per bar through an ivm.Reference that returns the view as JSON.
+// The Q1/Q2 hook inside the isolate. The hook core (normaliser, recorder, getters) is the engine's own
+// src/engine/hook-core.ts, bundled by esbuild into the global `HookCore`: one source, no copy. Only the
+// per-bar wrapper below is isolate-specific. The broker stays in the host and is called once per bar
+// through an ivm.Reference that returns the view as JSON.
+let hookCoreJs: Promise<string> | null = null;
+export function hookCoreBundle(): Promise<string> {
+  hookCoreJs ??= build({
+    entryPoints: [fileURLToPath(new URL('../src/engine/hook-core.ts', import.meta.url))],
+    bundle: true,
+    format: 'iife',
+    globalName: 'HookCore',
+    platform: 'neutral',
+    target: 'es2022',
+    write: false,
+  }).then((out) => out.outputFiles[0]!.text);
+  return hookCoreJs;
+}
+
 const ISOLATE_HOOK = `
 globalThis.__runHooked = async function (src, candles, brokerRef) {
-  const SIG = {
-    entry: ['id','direction','qty','limit','stop','oca_name','oca_type','comment','alert_message','disable_alert'],
-    order: ['id','direction','qty','limit','stop','oca_name','oca_type','comment','alert_message','disable_alert'],
-    exit: ['id','from_entry','qty','qty_percent','profit','limit','loss','stop','trail_price','trail_points','trail_offset','oca_name','comment','comment_profit','comment_loss','comment_trailing','alert_message','alert_profit','alert_loss','alert_trailing','disable_alert'],
-    close: ['id','comment','qty','qty_percent','alert_message','immediately','disable_alert'],
-    close_all: ['comment','alert_message','immediately','disable_alert'],
-    cancel: ['id'],
-    cancel_all: [],
-  };
-  const cur = (v) => {
-    if (v === null || typeof v !== 'object') return v;
-    if (typeof v.get === 'function' && Array.isArray(v.data)) return v.get(0);
-    if ('__value' in v) return v.__value;
-    return v;
-  };
-  const isBag = (v) => v !== null && typeof v === 'object' && Object.getPrototypeOf(v) === Object.prototype && !('__value' in v);
-  const norm = (m, raw) => {
-    const args = Object.fromEntries(SIG[m].map((k) => [k, undefined]));
-    for (let i = 0; i < raw.length; i++) {
-      const a = raw[i];
-      if (isBag(a)) { for (const [k, v] of Object.entries(a)) args[k] = cur(v); break; }
-      if (SIG[m][i] !== undefined && a !== undefined) args[SIG[m][i]] = cur(a);
-    }
-    return args;
-  };
   const calls = [];
   let patched = null, view = null;
-  const patch = ($) => {
-    const ns = $.pine.strategy;
-    for (const m of Object.keys(SIG)) ns[m] = (...raw) => { calls.push({ bar: $.idx, time: $.marketData[$.idx].openTime, method: m, args: norm(m, raw) }); };
-    if (brokerRef) {
-      ns.position_size = () => view.position_size;
-      ns.position_avg_price = () => view.position_avg_price;
-      ns.equity = () => view.equity;
-      ns.netprofit = () => view.netprofit;
-      ns.openprofit = () => view.openprofit;
-      ns.opentrades = () => {
-        const l = view.opentrades, n = l.length, at = (i) => l[Number.isNaN(Number(i)) ? 0 : Number(i)];
-        return { __value: n, valueOf: () => n, toString: () => String(n), [Symbol.toPrimitive]: () => n,
-          size: (i) => at(i)?.size ?? 0, entry_price: (i) => at(i)?.entry_price ?? NaN, entry_id: (i) => at(i)?.id ?? '',
-          entry_bar_index: (i) => at(i)?.entry_bar_index ?? NaN, entry_time: (i) => at(i)?.entry_time ?? NaN, profit: (i) => at(i)?.profit ?? 0 };
-      };
-    }
-  };
+  const patch = ($) => HookCore.installStrategyHooks($.pine.strategy, {
+    onCall: (m, raw) => { calls.push({ bar: $.idx, time: $.marketData[$.idx].openTime, method: m, args: HookCore.normaliseOrderArgs(m, raw) }); },
+    view: brokerRef ? () => view : undefined,
+  });
   const ind = new PineTSLib.Indicator(src);
   const prepared = ind.prepare();
   const orig = prepared.fn;
@@ -106,6 +85,7 @@ export async function runHookedInIsolate(
     await jail.set('globalThis', jail.derefInto());
     await context.eval('globalThis.console = { log() {}, info() {}, warn() {}, error() {}, debug() {} };');
     await (await isolate.compileScript(pinetsBrowserBundle(), { filename: 'pinets.min.browser.js' })).run(context);
+    await context.eval(await hookCoreBundle());
     await context.eval(ISOLATE_HOOK);
     const klines = candles.map((c) => ({ ...c, closeTime: c.openTime + H4_MS }));
     const run = (await jail.get('__runHooked', { reference: true })) as ivm.Reference<(...a: unknown[]) => Promise<string>>;
