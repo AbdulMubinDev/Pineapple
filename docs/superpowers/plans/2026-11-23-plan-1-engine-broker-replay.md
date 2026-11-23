@@ -318,6 +318,14 @@ Unknown functions only fail when the script runs. So `compileScript` also runs t
 
 **Interfaces:**
 - Consumes: `runStrategy` and `BarHooks`, `StrategyLayer`, `PaperBroker`, `loadCandles`, `loadFunding`.
+- Task 5 interface additions (binding):
+  - `new StrategyLayer(decl, broker, symbol, sizing, { rules, from })`.
+  - `await compileScript(src)`. It is async because it runs PineTS.
+  - `decl.processOrdersOnClose`.
+  - `broker.lastPriceOf(symbol)`.
+  - The replay logs `layer.anomalies()` (pyramiding overflows, exit legs that had to be re-sent) next to `broker.rejections()` in its output.
+  - Every `Fill[]` returned by `onBarOpen`, `onBarRange` and `onMark` must be passed to `layer.onFills(fills, bar, idx)` straight away. Each intent it returns is then submitted. This is how held exits go live and how pyramiding is re-checked at fill time.
+- `process_orders_on_close = true`: Task 5 rejects it in `compileScript`. This task implements it and removes the rejection. In `hooks.after`, market intents fill at `bar.close` ± slippage on the same bar, via a broker call that fills pending market orders at a given price (add it if missing, and test it), followed by `layer.onFills`. Test: a script with `process_orders_on_close=true` gets its entry `entryTime` on the signal bar.
 - Produces:
   - `TvProperties { initialCapital: number; commissionPct: number; slippageTicks: number }`
   - `replay(o: { source: string; symbol: string; tf: Timeframe; candles: Candle[]; funding: FundingEvent[]; from: number; to: number; mode: BrokerMode; tv?: TvProperties; rules: PairRules; fees?: FeeConfig; startingBalance: number; sizing: SizingRule }): Promise<{ trades: ClosedTrade[]; equityCurve: { time: number; equity: number }[]; summary: Summary }>`
@@ -326,10 +334,10 @@ Unknown functions only fail when the script runs. So `compileScript` also runs t
 
 **Order of events for each bar `b` in [from, to] (spec: fill at the next bar's open):**
 Inside `hooks.before(b)`:
-1. `broker.onBarOpen(b)`
+1. `broker.onBarOpen(b)`, then `layer.onFills`, then submit the returned intents
 2. Apply funding events with `b.openTime ≤ t < b.openTime + tf`. When `markPrice` is 0, the broker substitutes the last price.
 3. `binance` mode only: `broker.onMark` at the bar's adverse extreme (low for a long, high for a short), applied in path order with `onBarRange`. Liquidation wins only if the liquidation price is reached before the stop on the intrabar path (`|H−O| < |O−L|` → O→H→L→C, else O→L→H→C).
-4. `broker.onBarRange(b)`
+4. `broker.onBarRange(b)`, then `layer.onFills` for its fills and for any liquidation fills from step 3, then submit the returned intents
 5. `broker.markToMarket(b.close)`
 6. Return `layer.scriptView()`.
 
