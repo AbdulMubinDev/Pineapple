@@ -1,9 +1,10 @@
-// In-memory ExchangeClient for tests (REST half). Serves recorded candles and funding through the same
-// paging code and RestBudget as BinanceClient, supports scripted responses and records every call.
+// In-memory ExchangeClient for tests. Serves recorded candles and funding through the same paging code and RestBudget
+// as BinanceClient, supports scripted responses and records every call. Streams are scripted: tests push Binance-shaped
+// `{ stream, data }` envelopes to the open connections that subscribe to them.
 import { tfToMs } from '../core/timeframe.js';
 import type { Candle, FundingEvent, Timeframe } from '../core/types.js';
 import { fetchFundingHistory, fetchKlines, type PageDeps } from '../data/binance-rest.js';
-import type { ExchangeClient, PairInfo, Ticker24h } from './client.js';
+import type { ExchangeClient, MarkUpdate, PairInfo, Ticker24h } from './client.js';
 import { budgetedGet, REST_LIMIT_PER_MIN, RestBudget } from './budget.js';
 
 /** One scripted reply, consumed by the next REST request (any endpoint) before real data is served. */
@@ -32,11 +33,25 @@ export interface FakeExchangeOptions {
   fundingIntervals?: Map<string, number>;
 }
 
+/** One fake stream connection, as opened by `stream()`. */
+export interface FakeConnection {
+  streams: string[];
+  open: boolean;
+  /** Closed by the caller or dropped by `dropStreams()`. */
+  closed: boolean;
+  onMsg: (m: unknown) => void;
+  onState: (s: 'open' | 'closed') => void;
+}
+
 const tfBySymbolKey = (symbol: string, tf: Timeframe): string => `${symbol}|${tf}`;
 
 export class FakeExchange implements ExchangeClient {
   readonly budget: RestBudget;
   readonly calls: FakeCall[] = [];
+  /** Every stream connection ever opened, oldest first. */
+  readonly connections: FakeConnection[] = [];
+  /** When true (default), new connections report 'open' on the next microtask; when false they stay pending. */
+  autoOpenStreams = true;
   private readonly candles = new Map<string, Candle[]>();
   private readonly funding = new Map<string, FundingEvent[]>();
   private readonly scripted: ScriptedResponse[] = [];
@@ -127,7 +142,61 @@ export class FakeExchange implements ExchangeClient {
     return Promise.resolve(this.o.fundingIntervals ?? new Map());
   }
 
-  stream(): { close(): void } {
-    throw new Error('not implemented');
+  stream(streams: string[], onMsg: (m: unknown) => void, onState: (s: 'open' | 'closed') => void): { close(): void } {
+    const conn: FakeConnection = { streams: [...streams], open: false, closed: false, onMsg, onState };
+    this.connections.push(conn);
+    if (this.autoOpenStreams) {
+      queueMicrotask(() => {
+        if (conn.closed) return;
+        conn.open = true;
+        onState('open');
+      });
+    }
+    // Like BinanceClient: a close the caller asked for is silent.
+    return { close: () => void (conn.closed = true) };
+  }
+
+  /** Deliver `{ stream, data }` to every open connection subscribed to `stream`. */
+  pushRaw(stream: string, data: unknown): void {
+    for (const c of this.connections) if (c.open && !c.closed && c.streams.includes(stream)) c.onMsg({ stream, data });
+  }
+
+  /** A kline event (`closed` = the k.x flag), stamped with the injected clock. */
+  pushKline(symbol: string, tf: Timeframe, c: Candle, closed = true): void {
+    const k = {
+      t: c.openTime,
+      T: c.openTime + tfToMs(tf) - 1,
+      s: symbol,
+      i: tf,
+      o: String(c.open),
+      h: String(c.high),
+      l: String(c.low),
+      c: String(c.close),
+      v: String(c.volume),
+      x: closed,
+    };
+    this.pushRaw(`${symbol.toLowerCase()}@kline_${tf}`, { e: 'kline', E: this.o.now(), s: symbol, k });
+  }
+
+  pushTickers(rows: { symbol: string; last: number }[]): void {
+    const E = this.o.now();
+    this.pushRaw('!ticker@arr', rows.map((r) => ({ e: '24hrTicker', E, s: r.symbol, c: String(r.last) })));
+  }
+
+  pushMarks(rows: MarkUpdate[]): void {
+    this.pushRaw(
+      '!markPrice@arr@1s',
+      rows.map((m) => ({ e: 'markPriceUpdate', E: m.time, s: m.symbol, p: String(m.markPrice), r: String(m.fundingRate), T: m.nextFundingTime })),
+    );
+  }
+
+  /** The server drops every open or pending connection: each reports 'closed'. */
+  dropStreams(): void {
+    for (const c of this.connections) {
+      if (c.closed) continue;
+      c.closed = true;
+      c.open = false;
+      c.onState('closed');
+    }
   }
 }

@@ -1,6 +1,7 @@
 import type { Candle, FundingEvent, Timeframe } from '../core/types.js';
 import { fetchFundingHistory, fetchKlines, type PageDeps } from '../data/binance-rest.js';
 import { httpGet } from '../net/http.js';
+import { openSocket, type SocketHandlers } from '../net/ws.js';
 import {
   budgetedGet,
   EXCHANGE_INFO_WEIGHT,
@@ -14,6 +15,9 @@ import type { ExchangeClient, PairInfo, Ticker24h } from './client.js';
 import { buildUniverse } from './universe.js';
 
 const BASE = 'https://fapi.binance.com';
+// Market-data combined streams. The legacy /stream path still accepts the connection but sends nothing (seen
+// 2026-11-24 against live fstream), so market streams use /market/stream.
+export const WS_STREAM_BASE = 'wss://fstream.binance.com/market/stream';
 export const DEFAULT_FUNDING_HOURS = 8;
 
 /** Funding interval for a symbol; symbols absent from /fapi/v1/fundingInfo use 8 hours. */
@@ -60,15 +64,18 @@ export interface BinanceClientOptions {
   /** Injectable for tests; defaults to the allowlisted httpGet. */
   get?: (url: string, opts: { timeoutMs?: number }) => Promise<RestResponse>;
   now?: () => number;
+  /** Injectable for tests; defaults to the allowlisted openSocket. */
+  openSocket?: (url: string, h: SocketHandlers) => { close(): void };
 }
 
-/** Binance USDT-M futures client, public endpoints only. Every REST call is charged to the RestBudget. Streams arrive in Task 3. */
+/** Binance USDT-M futures client, public endpoints only. Every REST call is charged to the RestBudget. */
 export class BinanceClient implements ExchangeClient {
   /** Malformed entries dropped from the last response of each endpoint. */
-  skipped = { tickers: 0, fundingInfo: 0 };
+  skipped = { tickers: 0, fundingInfo: 0, streamMessages: 0 };
   readonly budget: RestBudget;
   private readonly get: NonNullable<BinanceClientOptions['get']>;
   private readonly deps: PageDeps;
+  private readonly openSocket: NonNullable<BinanceClientOptions['openSocket']>;
 
   constructor(o: BinanceClientOptions = {}) {
     const now = o.now ?? Date.now;
@@ -76,6 +83,7 @@ export class BinanceClient implements ExchangeClient {
       o.budget ??
       new RestBudget({ limitPerMin: REST_LIMIT_PER_MIN, now, sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)) });
     this.get = o.get ?? httpGet;
+    this.openSocket = o.openSocket ?? openSocket;
     this.deps = { getJson: (url, weight) => this.getJson(url, weight), now };
   }
 
@@ -108,7 +116,40 @@ export class BinanceClient implements ExchangeClient {
     return intervals;
   }
 
-  stream(): { close(): void } {
-    throw new Error('not implemented');
+  /**
+   * One combined-stream connection: wss://fstream.binance.com/market/stream?streams=a/b/c. Each message is the parsed
+   * `{ stream, data }` envelope; frames that are not JSON are dropped and counted in `skipped.streamMessages`.
+   * 'closed' is reported once, for a close the caller did not ask for; `close()` itself is silent.
+   */
+  stream(streams: string[], onMsg: (m: unknown) => void, onState: (s: 'open' | 'closed') => void): { close(): void } {
+    let done = false;
+    const sock = this.openSocket(`${WS_STREAM_BASE}?streams=${streams.join('/')}`, {
+      onOpen: () => {
+        if (!done) onState('open');
+      },
+      onMessage: (d) => {
+        if (done) return;
+        let m: unknown;
+        try {
+          m = JSON.parse(d);
+        } catch {
+          this.skipped.streamMessages++;
+          return;
+        }
+        onMsg(m);
+      },
+      onClose: () => {
+        if (done) return;
+        done = true;
+        onState('closed');
+      },
+    });
+    return {
+      close: () => {
+        if (done) return;
+        done = true;
+        sock.close();
+      },
+    };
   }
 }

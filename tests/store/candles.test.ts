@@ -35,6 +35,17 @@ describe('openDb', () => {
 });
 
 describe('CandleRepo', () => {
+  it('upsertMany writes several symbols in one transaction, all or nothing', () => {
+    const repo = new CandleRepo(openDb(':memory:'));
+    repo.upsertMany('1h', new Map([['A', [bar(1), bar(2)]], ['B', [bar(1)]]]));
+    expect(repo.count('A', '1h')).toBe(2);
+    expect(repo.count('B', '1h')).toBe(1);
+    const bad = { ...bar(3), close: null as unknown as number }; // violates NOT NULL
+    expect(() => repo.upsertMany('1h', new Map([['C', [bar(1)]], ['A', [bad]]]))).toThrow();
+    expect(repo.count('C', '1h')).toBe(0);
+    expect(repo.count('A', '1h')).toBe(2);
+  });
+
   it('candles round-trip and upsert is idempotent', () => {
     const repo = new CandleRepo(openDb(':memory:'));
     const bars = [1, 2, 3].map((i) => bar(i));

@@ -61,6 +61,15 @@ export class CandleRepo {
     });
   }
 
+  /** Upsert several symbols' candles in one transaction: all of them are written, or none. */
+  upsertMany(tf: Timeframe, bySymbol: Map<string, Candle[]>): void {
+    inTransaction(this.db, () => {
+      for (const [symbol, candles] of bySymbol) {
+        for (const c of candles) this.stmts.upsert.run(symbol, tf, c.openTime, c.open, c.high, c.low, c.close, c.volume);
+      }
+    });
+  }
+
   /** Candles with openTime in [fromMs, toMs], oldest first. */
   range(symbol: string, tf: Timeframe, fromMs: number, toMs: number): Candle[] {
     return (this.stmts.range.all(symbol, tf, fromMs, toMs) as unknown as CandleRow[]).map(toCandle);
