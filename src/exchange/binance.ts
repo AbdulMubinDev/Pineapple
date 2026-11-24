@@ -5,28 +5,61 @@ import type { ExchangeClient, PairInfo, Ticker24h } from './client.js';
 import { buildUniverse } from './universe.js';
 
 const BASE = 'https://fapi.binance.com';
-const DEFAULT_FUNDING_HOURS = 8;
+export const DEFAULT_FUNDING_HOURS = 8;
 
-interface RawTicker {
-  symbol: string;
-  lastPrice: string;
-  quoteVolume: string;
+/** Funding interval for a symbol; symbols absent from /fapi/v1/fundingInfo use 8 hours. */
+export function fundingHoursFor(map: Map<string, number>, symbol: string): number {
+  return map.get(symbol) ?? DEFAULT_FUNDING_HOURS;
 }
-interface RawFundingInfo {
-  symbol: string;
-  fundingIntervalHours?: number;
+
+const finite = (v: unknown): v is string | number =>
+  (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) || (typeof v === 'number' && Number.isFinite(v));
+
+/** Parse /fapi/v1/ticker/24hr. Entries without a symbol or finite quoteVolume/lastPrice are skipped and counted. */
+export function parseTickers(raw: unknown): { tickers: Ticker24h[]; skipped: number } {
+  if (!Array.isArray(raw)) throw new Error('ticker/24hr: expected an array response');
+  const tickers: Ticker24h[] = [];
+  let skipped = 0;
+  for (const t of raw as Record<string, unknown>[]) {
+    if (t && typeof t.symbol === 'string' && finite(t.quoteVolume) && finite(t.lastPrice)) {
+      tickers.push({ symbol: t.symbol, quoteVolume: Number(t.quoteVolume), lastPrice: Number(t.lastPrice) });
+    } else {
+      skipped++;
+    }
+  }
+  return { tickers, skipped };
+}
+
+/** Parse /fapi/v1/fundingInfo. Entries without a symbol and a positive finite fundingIntervalHours are skipped and counted. */
+export function parseFundingInfo(raw: unknown): { intervals: Map<string, number>; skipped: number } {
+  if (!Array.isArray(raw)) throw new Error('fundingInfo: expected an array response');
+  const intervals = new Map<string, number>();
+  let skipped = 0;
+  for (const r of raw as Record<string, unknown>[]) {
+    const h = r?.fundingIntervalHours;
+    if (r && typeof r.symbol === 'string' && typeof h === 'number' && Number.isFinite(h) && h > 0) {
+      intervals.set(r.symbol, h);
+    } else {
+      skipped++;
+    }
+  }
+  return { intervals, skipped };
 }
 
 /** Binance USDT-M futures client, public endpoints only. Streams arrive in Task 3. */
 export class BinanceClient implements ExchangeClient {
+  /** Malformed entries dropped from the last response of each endpoint. */
+  skipped = { tickers: 0, fundingInfo: 0 };
+
   async pairs(): Promise<PairInfo[]> {
     const info = await httpGetJson<unknown>(`${BASE}/fapi/v1/exchangeInfo`, { timeoutMs: 30_000 });
     return buildUniverse(info).pairs;
   }
 
   async tickers24h(): Promise<Ticker24h[]> {
-    const raw = await httpGetJson<RawTicker[]>(`${BASE}/fapi/v1/ticker/24hr`, { timeoutMs: 30_000 });
-    return raw.map((t) => ({ symbol: t.symbol, quoteVolume: Number(t.quoteVolume), lastPrice: Number(t.lastPrice) }));
+    const { tickers, skipped } = parseTickers(await httpGetJson<unknown>(`${BASE}/fapi/v1/ticker/24hr`, { timeoutMs: 30_000 }));
+    this.skipped.tickers = skipped;
+    return tickers;
   }
 
   klines(symbol: string, tf: Timeframe, fromMs: number, toMs: number): Promise<Candle[]> {
@@ -38,12 +71,9 @@ export class BinanceClient implements ExchangeClient {
   }
 
   async fundingIntervalHours(): Promise<Map<string, number>> {
-    const raw = await httpGetJson<RawFundingInfo[]>(`${BASE}/fapi/v1/fundingInfo`);
-    const out = new Map<string, number>();
-    for (const r of raw) {
-      out.set(r.symbol, Number.isFinite(r.fundingIntervalHours) && r.fundingIntervalHours! > 0 ? r.fundingIntervalHours! : DEFAULT_FUNDING_HOURS);
-    }
-    return out;
+    const { intervals, skipped } = parseFundingInfo(await httpGetJson<unknown>(`${BASE}/fapi/v1/fundingInfo`));
+    this.skipped.fundingInfo = skipped;
+    return intervals;
   }
 
   stream(): { close(): void } {

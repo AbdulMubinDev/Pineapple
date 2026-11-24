@@ -56,4 +56,48 @@ describe('buildUniverse', () => {
     });
     expect(pairs[0]!.rules.stepSize).toBe(0.5);
   });
+
+  it('MARKET_LOT_SIZE wins over LOT_SIZE when they differ', () => {
+    const { pairs } = buildUniverse({
+      symbols: [mk('XUSDT', { filters: [
+        { filterType: 'PRICE_FILTER', tickSize: '0.01' },
+        { filterType: 'LOT_SIZE', stepSize: '0.5' },
+        { filterType: 'MARKET_LOT_SIZE', stepSize: '0.25' },
+        { filterType: 'MIN_NOTIONAL', notional: '5' },
+      ] })],
+    });
+    expect(pairs[0]!.rules.stepSize).toBe(0.25);
+  });
+
+  it('excludes a symbol with a missing or non-positive filter without dropping the others', () => {
+    const good = [
+      { filterType: 'PRICE_FILTER', tickSize: '0.01' },
+      { filterType: 'MARKET_LOT_SIZE', stepSize: '1' },
+      { filterType: 'MIN_NOTIONAL', notional: '5' },
+    ];
+    const { pairs, excluded } = buildUniverse({
+      symbols: [
+        mk('AUSDT', { filters: good }),
+        mk('NOPRICEUSDT', { filters: good.filter((f) => f.filterType !== 'PRICE_FILTER') }),
+        mk('ZEROSTEPUSDT', { filters: good.map((f) => (f.stepSize ? { ...f, stepSize: '0' } : f)) }),
+        mk('EMPTYTICKUSDT', { filters: good.map((f) => (f.tickSize ? { ...f, tickSize: '' } : f)) }),
+        mk('ZUSDT', { filters: good }),
+      ],
+    });
+    expect(pairs.map((p) => p.symbol)).toEqual(['AUSDT', 'ZUSDT']);
+    expect(excluded).toEqual([
+      { symbol: 'NOPRICEUSDT', reason: 'bad_filters:tickSize=missing' },
+      { symbol: 'ZEROSTEPUSDT', reason: 'bad_filters:stepSize="0"' },
+      { symbol: 'EMPTYTICKUSDT', reason: 'bad_filters:tickSize=""' },
+    ]);
+  });
+
+  it('uses an empty symbol, not the string undefined, when the symbol is missing', () => {
+    const { excluded } = buildUniverse({ symbols: [{ contractType: 'CURRENT_QUARTER' }] });
+    expect(excluded).toEqual([{ symbol: '', reason: 'not_perpetual' }]);
+  });
 });
+
+function mk(symbol: string, extra: Record<string, unknown>) {
+  return { symbol, contractType: 'PERPETUAL', status: 'TRADING', quoteAsset: 'USDT', underlyingType: 'COIN', onboardDate: 1, ...extra };
+}

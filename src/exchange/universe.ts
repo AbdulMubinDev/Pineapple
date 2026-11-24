@@ -25,25 +25,28 @@ function exclusionReason(s: RawSymbol): string | null {
   return null;
 }
 
-function num(v: string | undefined, what: string, symbol: string): number {
-  const n = Number(v);
-  if (v === undefined || !Number.isFinite(n)) throw new Error(`exchangeInfo: ${symbol} is missing ${what}`);
+/** A symbol that passed the filters but whose rules cannot be built; it is excluded, not fatal. */
+class BadFilters extends Error {}
+
+/** A strictly positive finite number from a string or number, or BadFilters naming the field. */
+function positive(v: unknown, what: string): number {
+  const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : typeof v === 'number' ? v : NaN;
+  if (!Number.isFinite(n) || n <= 0) throw new BadFilters(`${what}=${JSON.stringify(v) ?? 'missing'}`);
   return n;
 }
 
-function toPair(s: RawSymbol): PairInfo {
-  const symbol = s.symbol as string;
-  const filters = s.filters ?? [];
-  const find = (t: string) => filters.find((f) => f.filterType === t);
+function toPair(s: RawSymbol, symbol: string): PairInfo {
+  const filters = Array.isArray(s.filters) ? s.filters : [];
+  const find = (t: string) => filters.find((f) => f?.filterType === t);
   const lot = find('MARKET_LOT_SIZE') ?? find('LOT_SIZE');
   return {
     symbol,
-    onboardDate: num(String(s.onboardDate), 'onboardDate', symbol),
+    onboardDate: positive(s.onboardDate, 'onboardDate'),
     rules: {
       symbol,
-      tickSize: num(find('PRICE_FILTER')?.tickSize, 'PRICE_FILTER.tickSize', symbol),
-      stepSize: num(lot?.stepSize, 'MARKET_LOT_SIZE/LOT_SIZE.stepSize', symbol),
-      minNotional: num(find('MIN_NOTIONAL')?.notional, 'MIN_NOTIONAL.notional', symbol),
+      tickSize: positive(find('PRICE_FILTER')?.tickSize, 'tickSize'),
+      stepSize: positive(lot?.stepSize, 'stepSize'),
+      minNotional: positive(find('MIN_NOTIONAL')?.notional, 'minNotional'),
       // No public leverage-bracket source: use conservative estimates and flag them.
       maxLeverage: 20,
       leverageEstimated: true,
@@ -63,9 +66,18 @@ export function buildUniverse(exchangeInfo: unknown): {
   const pairs: PairInfo[] = [];
   const excluded: { symbol: string; reason: string }[] = [];
   for (const s of symbols) {
-    const reason = exclusionReason(s);
-    if (reason) excluded.push({ symbol: String(s.symbol), reason });
-    else pairs.push(toPair(s));
+    const symbol = typeof s?.symbol === 'string' ? s.symbol : '';
+    const reason = s ? exclusionReason(s) : 'malformed';
+    if (reason) {
+      excluded.push({ symbol, reason });
+      continue;
+    }
+    try {
+      pairs.push(toPair(s, symbol));
+    } catch (e) {
+      if (!(e instanceof BadFilters)) throw e;
+      excluded.push({ symbol, reason: `bad_filters:${e.message}` });
+    }
   }
   pairs.sort((a, b) => (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0));
   return { pairs, excluded };
