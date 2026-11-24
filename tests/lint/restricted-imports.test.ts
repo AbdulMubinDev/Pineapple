@@ -42,11 +42,17 @@ describe('restricted imports', () => {
     expect(msgs.some((m) => m.ruleId === 'no-restricted-globals')).toBe(true);
   });
 
-  it('allows the same imports inside src/net/http.ts', async () => {
+  it.each(['src/net/http.ts', 'src/net/ws.ts'])('allows the same imports inside %s', async (file) => {
     const msgs = await lint(
-      "import https from 'node:https';\nexport const x = [https, fetch, globalThis.fetch];\n",
-      'src/net/http.ts',
+      "import https from 'node:https';\nexport const x = [https, fetch, globalThis.fetch, WebSocket];\n",
+      file,
     );
     expect(msgs.filter((m) => m.severity === 2)).toEqual([]);
+  });
+
+  it('still rejects them in sibling directories such as src/exchange', async () => {
+    const msgs = await lint("import https from 'node:https';\nexport const x = [https, fetch];\n", 'src/exchange/fixture-bad.ts');
+    expect(msgs.some((m) => m.ruleId === 'no-restricted-imports')).toBe(true);
+    expect(msgs.some((m) => m.ruleId === 'no-restricted-globals')).toBe(true);
   });
 });

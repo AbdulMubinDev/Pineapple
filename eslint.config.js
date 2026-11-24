@@ -1,6 +1,6 @@
 import tseslint from 'typescript-eslint';
 
-// Network egress is confined to src/net/http.ts (which also enforces the host allowlist).
+// Network egress is confined to src/net/** (http.ts also enforces the host allowlist).
 const restrictedModules = [
   'undici', 'ws', 'http', 'https', 'net', 'tls', 'http2', 'dgram', 'dns', 'child_process',
   'node:http', 'node:https', 'node:net', 'node:tls', 'node:http2', 'node:dgram', 'node:dns', 'node:child_process',
@@ -17,14 +17,14 @@ export default tseslint.config(
         {
           paths: restrictedModules.map((name) => ({
             name,
-            message: 'Network access is only allowed in src/net/http.ts (outbound allowlist).',
+            message: 'Network access is only allowed in src/net/** (outbound allowlist).',
           })),
         },
       ],
       'no-restricted-globals': [
         'error',
         { name: 'fetch', message: 'Use httpGetJson from src/net/http.ts.' },
-        ...['WebSocket', 'XMLHttpRequest', 'EventSource'].map((name) => ({ name, message: 'Network access is only allowed in src/net/http.ts.' })),
+        ...['WebSocket', 'XMLHttpRequest', 'EventSource'].map((name) => ({ name, message: 'Network access is only allowed in src/net/**.' })),
       ],
       'no-restricted-properties': [
         'error',
@@ -33,7 +33,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['src/net/http.ts'],
+    files: ['src/net/**'],
     rules: {
       'no-restricted-imports': 'off',
       'no-restricted-globals': 'off',

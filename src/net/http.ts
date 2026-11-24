@@ -22,16 +22,38 @@ function assertAllowed(url: string): URL {
   return parsed;
 }
 
-/** GET a public JSON endpoint. Throws EgressBlockedError before any socket opens for non-allowlisted hosts. */
-export async function httpGetJson<T>(url: string, opts: { timeoutMs?: number } = {}): Promise<T> {
-  const parsed = assertAllowed(url);
-  const res = await fetch(parsed, {
+function rawGet(parsed: URL, opts: { timeoutMs?: number }): Promise<Response> {
+  return fetch(parsed, {
     method: 'GET',
     // A redirect could leave the allowlist; fail instead of following it.
     redirect: 'error',
     headers: { accept: 'application/json' },
     signal: AbortSignal.timeout(opts.timeoutMs ?? 15_000),
   });
+}
+
+/**
+ * GET a public endpoint and return status, headers and the parsed JSON body (null when the body is not JSON),
+ * without throwing on non-2xx so callers can read rate-limit headers on a 429. Same allowlist as httpGetJson.
+ */
+export async function httpGet(
+  url: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<{ status: number; headers: Headers; body: unknown }> {
+  const res = await rawGet(assertAllowed(url), opts);
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    body = null;
+  }
+  return { status: res.status, headers: res.headers, body };
+}
+
+/** GET a public JSON endpoint. Throws EgressBlockedError before any socket opens for non-allowlisted hosts. */
+export async function httpGetJson<T>(url: string, opts: { timeoutMs?: number } = {}): Promise<T> {
+  const parsed = assertAllowed(url);
+  const res = await rawGet(parsed, opts);
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} from ${parsed.hostname}${parsed.pathname}`);
   }
