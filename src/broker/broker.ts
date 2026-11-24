@@ -16,6 +16,7 @@ import type {
   StoredOrder,
   SubmitResult,
 } from '../core/types.js';
+import { plainCopy } from '../core/plain-json.js';
 import { fillPrice, floorToStep, marginRequired, roundToTick, tradeFee } from './costs.js';
 import { liquidationPrice, maintenance } from './margin.js';
 
@@ -292,7 +293,7 @@ export class PaperBroker {
   }
 
   snapshot(): BrokerState {
-    return clone({
+    return plainCopy<BrokerState>({
       balance: this.balance,
       feesPaid: this.feesPaid,
       fundingNet: this.fundingNet,
@@ -306,7 +307,7 @@ export class PaperBroker {
       realisedNet: this.realised,
       fees: this.fees,
       sizing: this.sizing,
-    });
+    }, 'PaperBroker snapshot');
   }
 
   /**

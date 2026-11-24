@@ -54,6 +54,31 @@ describe('request.security on another symbol', () => {
   });
 });
 
+describe('replay on another pair', () => {
+  it('compiles as the replayed symbol: an ETHUSDT replay of an own-symbol request runs', { timeout: 60_000 }, async () => {
+    const src =
+      '//@version=6\nstrategy("e", overlay = true)\nd = request.security("ETHUSDT", "D", close[1], lookahead = barmerge.lookahead_on)\n' +
+      'if close > d\n    strategy.entry("L", strategy.long, qty = 0.1)\nif close < d\n    strategy.close("L")\n';
+    const bars = candles15m(400);
+    const r = await replay({
+      source: src,
+      symbol: 'ETHUSDT',
+      tf: '15m',
+      candles: bars,
+      funding: [],
+      from: bars[150]!.openTime,
+      to: bars.at(-1)!.openTime,
+      mode: 'tradingview',
+      tv: { initialCapital: 10_000, commissionPct: 0.05, slippageTicks: 0 },
+      rules: { ...rules, symbol: 'ETHUSDT' },
+      startingBalance: 10_000,
+      sizing: { kind: 'script' },
+    });
+    expect(r.trades.length).toBeGreaterThan(0);
+    expect(r.trades.every((t) => t.symbol === 'ETHUSDT')).toBe(true);
+  });
+});
+
 describe('compileScript lists security timeframes', () => {
   const LITERAL = (n: number) => `request.security timeframe on line ${n} must be a literal in v1`;
 

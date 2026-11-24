@@ -209,6 +209,27 @@ describe('LayerState', () => {
     expect(drive(4)).toEqual(plain);
   });
 
+  it('restore defaults sizing to the broker\'s current rule, and the check compares the rule, not its JSON', () => {
+    const b = new PaperBroker({ ...brokerOpts, sizing: { kind: 'fixed', notionalUsd: 1_000 } });
+    b.markToMarket(SYM, 50_000);
+    const reordered = { notionalUsd: 1_000, kind: 'fixed' } as const;
+    const layer = new StrategyLayer(decl(), b, SYM, reordered, { rules });
+    b.setSizing({ kind: 'fixed', notionalUsd: 2_000 });
+    const r = StrategyLayer.restore(json(layer.snapshot()), decl(), b, SYM, undefined, { rules });
+    expect(r.toIntents([entry('L', { qty: undefined })], flatBar(0))[0]!.qty).toBe(0.04);
+  });
+
+  it('a fee edit before a restart still sizes with the new fees after it', () => {
+    const d = { defaultQtyType: 'percent_of_equity' as const, defaultQtyValue: 100, marginLong: 100 };
+    const b = new PaperBroker({ ...brokerOpts, startingBalance: 10_000 });
+    b.markToMarket(SYM, 50_000);
+    const layer = new StrategyLayer(decl(d), b, SYM, { kind: 'script' }, { rules });
+    b.setFees({ makerRate: 0.01, takerRate: 0.01, slippagePct: 0 });
+    const b2 = PaperBroker.restore(json(b.snapshot()), { ...brokerOpts, startingBalance: 10_000 });
+    const r = StrategyLayer.restore(json(layer.snapshot()), decl(d), b2, SYM, undefined, { rules });
+    expect(r.toIntents([entry('L', { qty: undefined })], flatBar(0))[0]!.qty).toBe(0.198);
+  });
+
   it('restore checks the state version', () => {
     const r = rig();
     const s = json(r.s.layer.snapshot()) as unknown as Record<string, unknown>;

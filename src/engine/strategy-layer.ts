@@ -34,7 +34,7 @@
 // broker's current rule (PaperBroker.setSizing), so an owner edit reaches both.
 import type { PaperBroker } from '../broker/broker.js';
 import { leverageInForce } from '../broker/margin.js';
-import type { Candle, Fill, OrderIntent, PairRules, SizingRule } from '../core/types.js';
+import type { Candle, FeeConfig, Fill, OrderIntent, PairRules, SizingRule } from '../core/types.js';
 import { decodeLayer, encodeLayer, type Dir, type ExitReg, type LayerState, type Lot, type OrderMeta, type TradeRecord } from './layer-state.js';
 import type { PineOrderCall, StrategyDeclaration } from './pine-runner.js';
 
@@ -129,6 +129,9 @@ export class StrategyLayer {
   /** An overfill lot has been part of the current broker position. */
   private tainted = false;
   private seq = 0;
+  /** The broker's fees when this layer was first built (see baseQty). */
+  private baseFees: FeeConfig;
+  private delisted = false;
 
   constructor(
     private readonly decl: StrategyDeclaration,
@@ -139,11 +142,12 @@ export class StrategyLayer {
   ) {
     // The layer sizes with the broker's rule as it is at each order (setSizing reaches both): a different
     // rule here would be silently ignored, so it is a wiring error.
-    if (JSON.stringify(sizing) !== JSON.stringify(broker.sizingRule())) {
-      throw new Error(`StrategyLayer(${symbol}): sizing ${JSON.stringify(sizing)} is not the broker's ${JSON.stringify(broker.sizingRule())}`);
-    }
+    const current = broker.sizingRule();
+    const same = sizing.kind === current.kind && (sizing.kind !== 'fixed' || (current.kind === 'fixed' && sizing.notionalUsd === current.notionalUsd));
+    if (!same) throw new Error(`StrategyLayer(${symbol}): sizing ${JSON.stringify(sizing)} is not the broker's ${JSON.stringify(current)}`);
     this.rules = opts.rules;
     this.from = opts.from;
+    this.baseFees = broker.feeConfig();
   }
 
   /** Plain JSON, saved with the broker's snapshot: restore() continues exactly where this left off. */
@@ -159,12 +163,24 @@ export class StrategyLayer {
       seq: this.seq,
       anomalies: this.anomalyLog,
       attributions: this.attributionLog,
+      baseFees: this.baseFees,
+      delisted: this.delisted,
     });
   }
 
-  /** The layer `s` was taken from, on the restored broker. The other arguments are the constructor's, as at construction. */
-  static restore(s: LayerState, decl: StrategyDeclaration, broker: PaperBroker, symbol: string, sizing: SizingRule, opts: LayerOptions): StrategyLayer {
-    const layer = new StrategyLayer(decl, broker, symbol, sizing, opts);
+  /**
+   * The layer `s` was taken from, on the restored broker. The other arguments are the constructor's, as at
+   * construction; `sizing` defaults to the broker's current rule.
+   */
+  static restore(
+    s: LayerState,
+    decl: StrategyDeclaration,
+    broker: PaperBroker,
+    symbol: string,
+    sizing: SizingRule | undefined,
+    opts: LayerOptions,
+  ): StrategyLayer {
+    const layer = new StrategyLayer(decl, broker, symbol, sizing ?? broker.sizingRule(), opts);
     const d = decodeLayer(symbol, s);
     layer.lots = d.lots;
     layer.records = d.records;
@@ -176,7 +192,25 @@ export class StrategyLayer {
     layer.seq = d.seq;
     layer.anomalyLog = d.anomalies;
     layer.attributionLog = d.attributions;
+    layer.baseFees = d.baseFees;
+    layer.delisted = d.delisted;
     return layer;
+  }
+
+  /**
+   * The pair left the exchange. Drops everything still held for it (exits waiting for an entry, parked
+   * entries, order bookkeeping) and refuses any later order. With a position, call broker.forceClose and
+   * pass its fill to onFills instead (that ends here too).
+   */
+  onDelisted(): void {
+    if (Math.abs(this.netSize()) > EPS) throw new Error(`StrategyLayer(${this.symbol}).onDelisted with an open position: forceClose it and pass the fill to onFills`);
+    for (const reg of [...this.exits.values()]) this.dropExit(reg);
+    for (const id of this.meta.keys()) this.broker.cancel(id);
+    this.parked.clear();
+    this.meta.clear();
+    this.lots = [];
+    this.records = [];
+    this.delisted = true;
   }
 
   /** Corrections the layer made after the broker acted (pyramiding overfills, re-sent exit legs). */
@@ -198,7 +232,7 @@ export class StrategyLayer {
 
   /** The order intents for one bar's calls, in call order. Cancellations are applied to the broker now. */
   toIntents(calls: PineOrderCall[], bar: Candle): OrderIntent[] {
-    if (this.from !== undefined && bar.openTime < this.from) return [];
+    if (this.delisted || (this.from !== undefined && bar.openTime < this.from)) return [];
     this.dropOrphanedExits();
     const batch = new Map<string, OrderIntent>();
     for (const c of calls) {
@@ -245,9 +279,7 @@ export class StrategyLayer {
       if (f.orderId.startsWith('delisting:')) {
         // The pair is leaving: the whole position closed, and nothing of the script's may follow it.
         this.attributeFullClose(f);
-        for (const reg of [...this.exits.values()]) this.dropExit(reg);
-        this.parked.clear();
-        this.meta.clear();
+        this.onDelisted();
         continue;
       }
       const m = this.meta.get(f.orderId);
@@ -448,6 +480,13 @@ export class StrategyLayer {
     }
     reg.wasLive = true;
     const dir = lots[0]!.dir;
+    // Other trades to protect (a reversal under an exit for every entry): its legs get a fresh start.
+    const protects = `${dir}|${[...new Set(lots.map((l) => l.entryId))].join('|')}`;
+    if (reg.protects !== undefined && reg.protects !== protects) {
+      reg.retries.clear();
+      reg.abandoned.clear();
+    }
+    reg.protects = protects;
     const total = lots.reduce((s, l) => s + l.qty, 0);
     const entryPrice = lots.reduce((s, l) => s + l.qty * l.price, 0) / total;
     const qty = this.partialQty(total, reg.qty, reg.qtyPercent);
@@ -815,7 +854,15 @@ export class StrategyLayer {
     if (sizing.kind === 'fixed') return this.roundQty(sizing.notionalUsd / price);
     if (qtyArg !== undefined) return this.roundQty(Math.abs(qtyArg));
     const value = this.decl.defaultQtyValue;
-    if (type === 'market' || type === 'stop') price += dir * (this.decl.overridden.slippage ?? 0) * this.rules.tickSize;
+    // The declaration's commission and slippage stand for the fees the run started with; after an owner
+    // edit (broker.setFees) the broker's fees in force are used instead.
+    const fees = this.feesEdited() ? this.broker.feeConfig() : undefined;
+    if (type === 'market' || type === 'stop') {
+      if (!fees) price += dir * (this.decl.overridden.slippage ?? 0) * this.rules.tickSize;
+      else if (fees.slippageTicks !== undefined) price += dir * fees.slippageTicks * this.rules.tickSize;
+      else price *= 1 + dir * fees.slippagePct;
+    }
+    const commissionPct = fees ? fees.takerRate * 100 : (this.decl.overridden.commission ?? 0);
     switch (this.decl.defaultQtyType) {
       case 'fixed':
         return this.roundQty(value);
@@ -825,9 +872,15 @@ export class StrategyLayer {
         const margin = dir > 0 ? this.decl.marginLong : this.decl.marginShort;
         const pct = margin === 0 ? Math.min(value, 100) : value;
         const amount = (this.broker.account().equity * pct) / 100;
-        return this.roundQty(amount / (price * (1 + (this.decl.overridden.commission ?? 0) / 100)));
+        return this.roundQty(amount / (price * (1 + commissionPct / 100)));
       }
     }
+  }
+
+  private feesEdited(): boolean {
+    const a = this.baseFees;
+    const b = this.broker.feeConfig();
+    return a.makerRate !== b.makerRate || a.takerRate !== b.takerRate || a.slippagePct !== b.slippagePct || a.slippageTicks !== b.slippageTicks;
   }
 
   /** qty / qty_percent of `total` (floored; at least one step for a percentage, never more than total). */

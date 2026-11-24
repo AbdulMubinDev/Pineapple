@@ -510,6 +510,55 @@ describe('StrategyLayer', () => {
     expect(() => new StrategyLayer(decl(), r.broker, SYM, { kind: 'fixed', notionalUsd: 1 }, { rules })).toThrow(/not the broker's/);
   });
 
+  it('after setFees, a 100%-equity entry is sized with the new fee and fills without rejection', () => {
+    const r = rig({ balance: 10_000, d: { defaultQtyType: 'percent_of_equity', defaultQtyValue: 100, marginLong: 100 } });
+    r.broker.setFees({ makerRate: 0.01, takerRate: 0.01, slippagePct: 0 });
+    // 10,000 / (50,000 * 1.01) = 0.19801.. -> 0.198 (at the old 0 % it would be 0.2, which no longer fits).
+    expect(r.after(flatBar(0), [entry('L', 'long')])[0]!.qty).toBe(0.198);
+    expect(r.before(flatBar(1)).positionSize).toBe(0.198);
+    expect(r.broker.rejections()).toEqual([]);
+  });
+
+  it('a fee edit is not one when the fees are unchanged: the declaration still sizes', () => {
+    const r = rig({ balance: 10_000, d: { defaultQtyType: 'percent_of_equity', defaultQtyValue: 50, marginLong: 100, overridden: { commission: 1 } } });
+    r.broker.setFees({ makerRate: 0, takerRate: 0, slippagePct: 0 });
+    // The rig's fees were already 0: commission 1 % from the declaration still applies (5,000 / 50,500).
+    expect(r.after(flatBar(0), [entry('L', 'long')])[0]!.qty).toBe(0.099);
+  });
+
+  it('an exit for every entry re-protects the new trade after a reversal, even with a leg abandoned', () => {
+    const r = rig();
+    r.after(flatBar(0), [entry('L', 'long', { qty: 1 })]);
+    r.ctl.reject = (i) => i.tag === 'exit';
+    for (let i = 1; i < 6; i++) {
+      r.before(flatBar(i));
+      r.after(flatBar(i), [exit('X', { stop: 48_000 })]);
+    }
+    expect(r.layer.anomalies().filter((a) => a.kind === 'exit_leg_abandoned')).toHaveLength(1);
+    r.ctl.reject = undefined;
+    r.after(flatBar(6), [entry('S', 'short', { qty: 1 }), exit('X', { stop: 52_000 })]);
+    r.before(flatBar(7));
+    expect(r.broker.position(SYM)).toMatchObject({ qty: -1 });
+    expect(r.broker.openOrders(SYM)).toEqual([expect.objectContaining({ id: 'BTCUSDT|X|X||stop', side: 'buy', stopPrice: 52_000 })]);
+  });
+
+  it('onDelisted on a flat pair drops held exits and pending entries, and later calls place nothing', () => {
+    const r = rig();
+    r.after(flatBar(0), [entry('L', 'long', { qty: 1, limit: 40_000 }), exit('X', { fromEntry: 'L', stop: 35_000 })]);
+    expect(r.broker.openOrders(SYM)).toHaveLength(1);
+    expect(r.broker.forceClose(SYM, 50_000, T0 + 1, 'delisting')).toEqual([]);
+    r.layer.onDelisted();
+    expect(r.broker.openOrders()).toEqual([]);
+    expect(r.layer.snapshot()).toMatchObject({ exits: [], parked: [], meta: [], delisted: true });
+    expect(r.layer.onFills([], flatBar(1), 1)).toEqual([]);
+    expect(r.layer.toIntents([entry('L', 'long', { qty: 1 })], flatBar(1))).toEqual([]);
+    // With a position it must go through forceClose.
+    const p = rig();
+    p.after(flatBar(0), [entry('L', 'long', { qty: 1 })]);
+    p.before(flatBar(1));
+    expect(() => p.layer.onDelisted()).toThrow(/forceClose/);
+  });
+
   it('scriptView cost does not grow with closed trades', () => {
     const r = rig({ balance: 1e9 });
     // 5,000 closed trades on other symbols, straight on the shared broker.
@@ -557,8 +606,9 @@ describe('StrategyLayer', () => {
     expect(r.layer.snapshot()).toMatchObject({ lots: [], records: [], exits: [], parked: [] });
     expect(r.broker.openOrders()).toEqual([]);
     expect(r.broker.closedTrades().at(-1)).toMatchObject({ exitReason: 'delisting', exitPrice: 49_000, qty: 1 });
-    // Nothing comes back on later settles either.
+    // Nothing comes back on later settles or calls either.
     expect(r.layer.onFills([], flatBar(2), 2)).toEqual([]);
+    expect(r.layer.toIntents([entry('C', 'long', { qty: 1 })], flatBar(2))).toEqual([]);
   });
 
   it('a held exit is dropped when its pending entry is rejected at the broker', () => {

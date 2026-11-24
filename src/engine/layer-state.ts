@@ -1,7 +1,8 @@
 // The StrategyLayer's own state, and its plain-JSON form for saving with the broker's (one transaction).
 // A live run restored from it must carry on exactly as an uninterrupted one: Maps keep their insertion
 // order as entry arrays, Sets become arrays, and `seq` comes back as it was, so order ids never repeat.
-import type { OrderIntent } from '../core/types.js';
+import { plainCopy } from '../core/plain-json.js';
+import type { FeeConfig, OrderIntent } from '../core/types.js';
 import type { LayerAnomaly, TradeAttribution } from './strategy-layer.js';
 
 export const LAYER_STATE_VERSION = 1;
@@ -66,8 +67,10 @@ export interface ExitReg {
   /** Legs the broker did not take, waiting to be sent again. */
   awaiting: Set<string>;
   retries: Map<string, LegRetry>;
-  /** Legs given up on after too many re-sends: never sent again for this exit. */
+  /** Legs given up on after too many re-sends: never sent again for the trades they protected. */
   abandoned: Set<string>;
+  /** The trades the legs protect (direction and entry ids); when it changes, the re-send counts start over. */
+  protects?: string;
 }
 
 /** Everything a StrategyLayer holds between calls. */
@@ -82,6 +85,10 @@ export interface LayerInternals {
   seq: number;
   anomalies: LayerAnomaly[];
   attributions: TradeAttribution[];
+  /** The broker's fees when the layer was first built: the declaration's commission / slippage stand for these. */
+  baseFees: FeeConfig;
+  /** The pair was delisted: no further orders. */
+  delisted: boolean;
 }
 
 export type LotState = Omit<Lot, 'exitsFilled'> & { exitsFilled: string[] };
@@ -108,16 +115,8 @@ export interface LayerState {
   seq: number;
   anomalies: LayerAnomaly[];
   attributions: TradeAttribution[];
-}
-
-/** A deep copy through JSON that refuses NaN / Infinity (JSON would silently turn them into null). */
-function plainCopy<T>(x: T, what: string): T {
-  return JSON.parse(
-    JSON.stringify(x, (k, v: unknown) => {
-      if (typeof v === 'number' && !Number.isFinite(v)) throw new Error(`${what}: ${k || 'value'} is ${v}, which JSON cannot hold`);
-      return v;
-    }),
-  ) as T;
+  baseFees: FeeConfig;
+  delisted: boolean;
 }
 
 export function encodeLayer(symbol: string, l: LayerInternals): LayerState {
@@ -140,6 +139,8 @@ export function encodeLayer(symbol: string, l: LayerInternals): LayerState {
     seq: l.seq,
     anomalies: l.anomalies,
     attributions: l.attributions,
+    baseFees: l.baseFees,
+    delisted: l.delisted,
   };
   return plainCopy(state, `StrategyLayer(${symbol}) snapshot`);
 }
@@ -164,5 +165,7 @@ export function decodeLayer(symbol: string, s: LayerState): LayerInternals {
     seq: c.seq,
     anomalies: c.anomalies,
     attributions: c.attributions,
+    baseFees: c.baseFees,
+    delisted: c.delisted,
   };
 }

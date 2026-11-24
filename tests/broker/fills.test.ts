@@ -213,6 +213,12 @@ describe('PaperBroker live support: forceClose, setFees, setSizing, realisedNet'
     expect(b.realisedNet('BTCUSDT')).toBe(t.pnl - t.fees + t.funding);
   });
 
+  it('snapshot refuses a non-finite number rather than saving it as null', () => {
+    const b = make();
+    b.markToMarket('ETHUSDT', NaN);
+    expect(() => b.snapshot()).toThrow(/PaperBroker snapshot: ETHUSDT is NaN/);
+  });
+
   it('forceClose with no position only cancels the orders', () => {
     const b = make();
     b.submit(order({ id: 'lim', type: 'limit', limitPrice: 40000 }), 0);

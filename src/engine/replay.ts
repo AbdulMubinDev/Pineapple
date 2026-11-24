@@ -207,7 +207,7 @@ export async function replay(o: ReplayOptions): Promise<ReplayResult> {
   assertContiguous(candles, o.tf);
   if (!candles.some((c) => c.openTime >= o.from)) throw new Error('replay: no candles between from and to');
 
-  const compiled = await compileScript(o.source, o.tf);
+  const compiled = await compileScript(o.source, o.tf, o.symbol);
   if (!compiled.ok) throw new ScriptCompileError(compiled.errors);
 
   let declaration: StrategyDeclaration;
