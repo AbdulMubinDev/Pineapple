@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { budgetedGet, klineWeight, RestBudget } from '../../src/exchange/budget.js';
-import { BinanceClient } from '../../src/exchange/binance.js';
+import { BinanceClient, KLINES_TIMEOUT_MS } from '../../src/exchange/binance.js';
 import { FakeExchange } from '../../src/exchange/fake.js';
 import { makeClock } from './clock.js';
 
@@ -137,5 +137,21 @@ describe('BinanceClient REST', () => {
     expect(clock.now() - t0).toBeLessThanOrEqual(60_000);
     // 1500-bar kline page costs 10; funding costs 1 (the spy saw both before our own acquire(20)).
     expect(weights.slice(0, 2)).toEqual([10, 1]);
+  });
+
+  it('bounds each klines request at KLINES_TIMEOUT_MS (6 s)', async () => {
+    const clock = makeClock();
+    const opts: { timeoutMs?: number }[] = [];
+    const client = new BinanceClient({
+      budget: new RestBudget({ limitPerMin: 1200, now: clock.now, sleep: clock.sleep }),
+      now: clock.now,
+      get: (_url, o) => {
+        opts.push(o);
+        return Promise.resolve({ status: 200, headers: new Headers(), body: [] });
+      },
+    });
+    await client.klines('BTCUSDT', '1h', 0, 3_600_000);
+    expect(KLINES_TIMEOUT_MS).toBe(6_000);
+    expect(opts).toEqual([{ timeoutMs: 6_000 }]);
   });
 });

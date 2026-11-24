@@ -19,6 +19,8 @@ const BASE = 'https://fapi.binance.com';
 // 2026-11-24 against live fstream), so market streams use /market/stream.
 export const WS_STREAM_BASE = 'wss://fstream.binance.com/market/stream';
 export const DEFAULT_FUNDING_HOURS = 8;
+/** Per klines request (a page of at most 1500 bars): keeps a hung first fetch of a LiveFeed batch bounded. */
+export const KLINES_TIMEOUT_MS = 6_000;
 
 /** Funding interval for a symbol; symbols absent from /fapi/v1/fundingInfo use 8 hours. */
 export function fundingHoursFor(map: Map<string, number>, symbol: string): number {
@@ -75,6 +77,7 @@ export class BinanceClient implements ExchangeClient {
   readonly budget: RestBudget;
   private readonly get: NonNullable<BinanceClientOptions['get']>;
   private readonly deps: PageDeps;
+  private readonly klineDeps: PageDeps;
   private readonly openSocket: NonNullable<BinanceClientOptions['openSocket']>;
 
   constructor(o: BinanceClientOptions = {}) {
@@ -85,6 +88,7 @@ export class BinanceClient implements ExchangeClient {
     this.get = o.get ?? httpGet;
     this.openSocket = o.openSocket ?? openSocket;
     this.deps = { getJson: (url, weight) => this.getJson(url, weight), now };
+    this.klineDeps = { getJson: (url, weight) => this.getJson(url, weight, KLINES_TIMEOUT_MS), now };
   }
 
   private getJson(url: string, weight: number, timeoutMs?: number): Promise<unknown> {
@@ -103,7 +107,7 @@ export class BinanceClient implements ExchangeClient {
   }
 
   klines(symbol: string, tf: Timeframe, fromMs: number, toMs: number): Promise<Candle[]> {
-    return fetchKlines(symbol, tf, fromMs, toMs, this.deps);
+    return fetchKlines(symbol, tf, fromMs, toMs, this.klineDeps);
   }
 
   fundingHistory(symbol: string, fromMs: number, toMs: number): Promise<FundingEvent[]> {

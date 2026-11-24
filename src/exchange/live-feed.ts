@@ -1,6 +1,7 @@
 import { barOpenFor, tfToMs } from '../core/timeframe.js';
 import type { Candle, Timeframe } from '../core/types.js';
 import type { CandleRepo } from '../store/candles.js';
+import { NetworkError } from '../net/http.js';
 import { HttpStatusError } from './budget.js';
 import type { ExchangeClient, MarkUpdate } from './client.js';
 
@@ -137,12 +138,23 @@ interface SymbolPlan {
   permanent: boolean;
   /** Its retry round hit the deadline: later replies are ignored for this batch. */
   sealed: boolean;
+  /** At least one of its bars in this batch came from the stream. */
+  streamed: boolean;
 }
 
 interface RoundResult {
-  ok: number;
+  /** Symbols whose fetch succeeded in this round. */
+  ok: string[];
   transient: { e: unknown } | null;
   odd: Map<SymbolPlan, unknown>;
+}
+
+/** What this batch knows about REST's health, to tell a symbol's own odd error from a REST-wide one. */
+interface Evidence {
+  /** Symbols whose REST fetch succeeded in this batch. */
+  ok: Set<string>;
+  /** The batch's one control probe: not sent yet, REST answered, or it failed too. */
+  probe: 'none' | 'ok' | 'failed';
 }
 
 type Rec = Record<string, unknown>;
@@ -150,11 +162,12 @@ const isRec = (v: unknown): v is Rec => typeof v === 'object' && v !== null;
 const num = (v: unknown): number => (typeof v === 'string' && v.trim() !== '' ? Number(v) : typeof v === 'number' ? v : NaN);
 /** A 4xx other than 429/418: this request is wrong for this symbol, retrying will not help. */
 const isPermanent = (e: unknown): boolean => e instanceof HttpStatusError && e.status >= 400 && e.status < 500 && e.status !== 429 && e.status !== 418;
-/** Failures that say nothing about one symbol: other HTTP statuses (5xx, 429, 418) and fetch-level errors (DNS, reset, timeout). */
+/**
+ * Failures that say nothing about one symbol: 5xx, 429 and 418, and fetch-level errors (DNS, reset, abort, timeout),
+ * which the http layer wraps in NetworkError. A bare TypeError is not one: a malformed 200 body throws that too.
+ */
 const isNetworkWide = (e: unknown): boolean =>
-  e instanceof HttpStatusError ||
-  e instanceof TypeError ||
-  (typeof e === 'object' && e !== null && ['AbortError', 'TimeoutError'].includes((e as { name?: unknown }).name as string));
+  e instanceof NetworkError || (e instanceof HttpStatusError && (e.status >= 500 || e.status === 429 || e.status === 418));
 
 /**
  * Live data for one chart timeframe: closed klines for its own symbols, plus last and mark prices for them.
@@ -598,11 +611,15 @@ export class LiveFeed {
       // Opens in [lo, latest] are already stored (e.g. loadHistory ran ahead of the feed): use them.
       for (const c of repo.range(s, tf, lo, Math.min(hi, latest.openTime))) bars.set(c.openTime, c);
     }
+    let streamed = false;
     for (let t = Math.max(from, lo); t <= hi; t += step) {
       const b = this.pending.get(t + step)?.bars.get(s);
-      if (b) bars.set(t, b);
+      if (b) {
+        bars.set(t, b);
+        streamed = true;
+      }
     }
-    return { symbol: s, from, storable, bars, permanent: false, sealed: false };
+    return { symbol: s, from, storable, bars, permanent: false, sealed: false, streamed };
   }
 
   /** Any open in [from, hi] without a bar (`batchOnly`: only the opens being emitted, [lo, hi]). */
@@ -626,7 +643,7 @@ export class LiveFeed {
    * keep their holes (and are sealed, so a late reply changes nothing).
    */
   private async fetchRound(plans: SymbolPlan[], hi: number, until?: number): Promise<RoundResult> {
-    const res: RoundResult = { ok: 0, transient: null, odd: new Map() };
+    const res: RoundResult = { ok: [], transient: null, odd: new Map() };
     let i = 0;
     let abandoned = false;
     const worker = async (): Promise<void> => {
@@ -635,7 +652,7 @@ export class LiveFeed {
         try {
           await this.fetchInto(p, hi);
           if (p.sealed) continue;
-          res.ok++;
+          res.ok.push(p.symbol);
           this.errorStreak.delete(p.symbol);
         } catch (e) {
           if (p.sealed) continue;
@@ -664,17 +681,40 @@ export class LiveFeed {
   }
 
   /**
-   * Decide a round: a network-wide failure fails the batch. Another error counts toward that symbol's streak only when
-   * some other symbol's fetch succeeded in this batch (so it is that symbol, not the network); at ERROR_STREAK_LIMIT the
-   * symbol is marked missing, below it the batch fails and is retried.
+   * Is REST healthy, so that `p`'s odd error is its own? Yes when another symbol's fetch succeeded in this batch.
+   * Otherwise one control probe per batch: a weight-1 (limit=1) klines request for a symbol that streamed in this
+   * batch, else any other symbol of the feed. Like the first fetch, the probe is not cut by the deadline (its request
+   * timeout bounds it). Throws the probe's error when that is network-wide.
    */
-  private settleRound(r: RoundResult, okInBatch: number): void {
+  private async restHealthy(p: SymbolPlan, r: RoundResult, ev: Evidence, plans: SymbolPlan[], hi: number): Promise<boolean> {
+    for (const s of ev.ok) if (s !== p.symbol) return true;
+    if (ev.probe !== 'none') return ev.probe === 'ok';
+    const usable = plans.filter((c) => c !== p && !r.odd.has(c) && !c.permanent);
+    const target = usable.find((c) => c.streamed) ?? usable[0];
+    if (target === undefined) return false;
+    try {
+      await this.o.client.klines(target.symbol, this.o.tf, hi, hi);
+      ev.probe = 'ok';
+      return true;
+    } catch (e) {
+      ev.probe = 'failed';
+      if (isNetworkWide(e)) throw e;
+      return false;
+    }
+  }
+
+  /**
+   * Decide a round: a network-wide failure fails the batch. Another error counts toward that symbol's streak only when
+   * REST is shown healthy (restHealthy: it is that symbol, not REST); at ERROR_STREAK_LIMIT the symbol is marked
+   * missing, below it the batch fails and is retried.
+   */
+  private async settleRound(r: RoundResult, ev: Evidence, plans: SymbolPlan[], hi: number): Promise<void> {
+    for (const s of r.ok) ev.ok.add(s);
     if (r.transient !== null) throw r.transient.e;
     if (r.odd.size === 0) return;
-    const [first] = r.odd.values();
-    if (okInBatch === 0) throw first;
     let rethrow: { e: unknown } | null = null;
     for (const [p, e] of r.odd) {
+      if (!(await this.restHealthy(p, r, ev, plans, hi))) throw e;
       const streak = (this.errorStreak.get(p.symbol) ?? 0) + 1;
       this.errorStreak.set(p.symbol, streak);
       if (streak >= ERROR_STREAK_LIMIT) {
@@ -704,13 +744,12 @@ export class LiveFeed {
     const plans = symbols.map((s) => this.planSymbol(s, lo, hi));
     // One fetch for every symbol with a hole anywhere it may write (gap fill included). Not cut by the deadline: a
     // slow or failing REST here is a network problem, and a close never fires without bars REST could still give.
-    let okInBatch = 0;
+    const ev: Evidence = { ok: new Set(), probe: 'none' };
     const first = await this.fetchRound(
       plans.filter((p) => this.hasHoles(p, lo, hi, false)),
       hi,
     );
-    okInBatch += first.ok;
-    this.settleRound(first, okInBatch);
+    await this.settleRound(first, ev, plans, hi);
     // Retry rounds, shared by the whole batch, only for bars being emitted that REST did not have yet, each bounded by
     // the deadline (a round starts only if its sleep plus FETCH_ALLOWANCE_MS fits).
     for (const delay of MISSING_RETRY_MS) {
@@ -719,8 +758,7 @@ export class LiveFeed {
       await this.sleep(delay);
       if (!this.running) break;
       const r = await this.fetchRound(waiting, hi, deadline);
-      okInBatch += r.ok;
-      this.settleRound(r, okInBatch);
+      await this.settleRound(r, ev, plans, hi);
     }
     if (!this.running) return;
 

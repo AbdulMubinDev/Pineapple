@@ -6,6 +6,7 @@ import { FakeExchange } from '../../src/exchange/fake.js';
 import { loadHistory } from '../../src/exchange/history.js';
 import { LiveFeed, MissingBarsError, RepoBehindError } from '../../src/exchange/live-feed.js';
 import { CandleRepo } from '../../src/store/candles.js';
+import { NetworkError } from '../../src/net/http.js';
 import { openDb } from '../../src/store/db.js';
 import { flush, makeClock, makeTimers } from './clock.js';
 
@@ -61,7 +62,12 @@ function setup(symbols = SYMS, repoLast: Record<string, number> = {}, lastCloseT
   return { clock, timers, client, repo, feed, closes, errors, to, pushAll };
 }
 
-const contiguous = (c: Candle[]): boolean => c.every((x, i) => i === 0 || x.openTime - c[i - 1]!.openTime === STEP);
+/** What BinanceClient throws for a fetch-level failure (DNS, reset, timeout). */
+const fetchFailed = () => new NetworkError('fapi.binance.com/fapi/v1/klines', new TypeError('fetch failed'));
+const symbolOf = (url: string) => new URL(url).searchParams.get('symbol');
+const limitOf = (url: string) => new URL(url).searchParams.get('limit');
+
+const contiguous =(c: Candle[]): boolean => c.every((x, i) => i === 0 || x.openTime - c[i - 1]!.openTime === STEP);
 const all = (repo: CandleRepo, s: string) => repo.range(s, TF, 0, Number.MAX_SAFE_INTEGER);
 
 describe('LiveFeed', () => {
@@ -542,7 +548,7 @@ describe('LiveFeed', () => {
     const { clock, client, feed, closes, to } = setup(SYMS, warm, B0 - STEP); // resumes one close behind
     const outageEnd = START + 30 * SEC;
     const real = client.klines.bind(client);
-    client.klines = (...a) => (clock.now() < outageEnd ? Promise.reject(new TypeError('fetch failed')) : real(...a));
+    client.klines = (...a) => (clock.now() < outageEnd ? Promise.reject(fetchFailed()) : real(...a));
     feed.start();
     await to(outageEnd - 1);
     expect(closes).toHaveLength(0); // never emitted without bars, however many batches failed
@@ -564,7 +570,7 @@ describe('LiveFeed', () => {
     const outageEnd = B1 + 60 * SEC;
     const real = client.klines.bind(client);
     client.klines = (s, ...rest) =>
-      s === 'SOLUSDT' && clock.now() < outageEnd ? Promise.reject(new TypeError('fetch failed')) : real(s, ...rest);
+      s === 'SOLUSDT' && clock.now() < outageEnd ? Promise.reject(fetchFailed()) : real(s, ...rest);
     feed.start();
     await to(B1 + 300);
     pushAll(B0, ['BTCUSDT']); // ETHUSDT over REST succeeds every batch
@@ -634,23 +640,134 @@ describe('LiveFeed', () => {
     feed.stop();
   });
 
-  it('a malformed reply for one symbol while others fetch fine marks it missing after 3 batches', async () => {
+  it('a malformed reply for the only symbol on REST, while the others stream, marks it missing after 3 batches', async () => {
     const { client, feed, closes, to, pushAll } = setup();
     client.failKlines('SOLUSDT', 'nonjson');
     feed.start();
     await to(B1 + 300);
-    pushAll(B0, ['BTCUSDT']); // ETHUSDT comes over REST and succeeds: the failure is SOLUSDT's own
+    pushAll(B0, ['BTCUSDT', 'ETHUSDT']); // only SOLUSDT needs REST: no other REST fetch can vouch for REST
     await to(B1 + 40 * SEC);
     expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([[B1, ['SOLUSDT']]]);
-    expect(closes[0]!.bars.get('ETHUSDT')).toEqual(restBar(B0));
+    // Held only for 3 batches: first at B1 + 3.3 s, then two watchdog retries (RETRY_MS, 5 s ticks).
+    expect(closes[0]!.at).toBeLessThanOrEqual(B1 + 300 + 3 * SEC + 2 * 2 * 5 * SEC);
+    expect(closes[0]!.bars.get('BTCUSDT')).toEqual(streamBar(B0));
+    expect(closes[0]!.bars.get('ETHUSDT')).toEqual(streamBar(B0));
+    // One weight-1 control probe per batch, for a symbol that streamed.
+    const probes = client.calls.filter((c) => symbolOf(c.url) !== 'SOLUSDT');
+    expect(probes).toHaveLength(3);
+    for (const c of probes) {
+      expect(symbolOf(c.url)).toBe('BTCUSDT');
+      expect(limitOf(c.url)).toBe('1');
+      expect(c.weight).toBe(1);
+    }
     const B2 = B1 + STEP;
     await to(B2 + 300);
-    pushAll(B1, ['BTCUSDT']);
+    pushAll(B1, ['BTCUSDT', 'ETHUSDT']);
     await to(B2 + 3500);
     expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([
       [B1, ['SOLUSDT']],
       [B2, ['SOLUSDT']],
     ]);
+    feed.stop();
+  });
+
+  it('a malformed reply for one symbol while others fetch fine over REST marks it missing after 3 batches', async () => {
+    const { client, feed, closes, to, pushAll } = setup();
+    client.failKlines('SOLUSDT', 'nonjson');
+    feed.start();
+    await to(B1 + 300);
+    pushAll(B0, ['BTCUSDT']); // ETHUSDT comes over REST and succeeds: that is the evidence, no probe needed
+    await to(B1 + 40 * SEC);
+    expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([[B1, ['SOLUSDT']]]);
+    expect(closes[0]!.bars.get('ETHUSDT')).toEqual(restBar(B0));
+    expect(client.calls.filter((c) => limitOf(c.url) === '1' && symbolOf(c.url) === 'BTCUSDT')).toHaveLength(0);
+    feed.stop();
+  });
+
+  it('a 200 with a malformed row ([null]) is that symbol\'s own error, not a network failure', async () => {
+    const { client, feed, closes, to, pushAll } = setup();
+    client.failKlines('SOLUSDT', { body: [null] });
+    feed.start();
+    await to(B1 + 300);
+    pushAll(B0, ['BTCUSDT', 'ETHUSDT']);
+    await to(B1 + 40 * SEC);
+    expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([[B1, ['SOLUSDT']]]);
+    feed.stop();
+  });
+
+  it('REST-wide malformed replies (the probe fails too) never emit a close without bars', async () => {
+    const { client, feed, closes, errors, to, pushAll } = setup();
+    for (const s of SYMS) client.failKlines(s, 'nonjson'); // e.g. a proxy answering every request with a 200 HTML page
+    feed.start();
+    await to(B1 + 300);
+    pushAll(B0, ['BTCUSDT', 'ETHUSDT']);
+    await to(B1 + 60 * SEC);
+    expect(closes).toHaveLength(0);
+    expect(errors.some((e) => e instanceof MissingBarsError)).toBe(false);
+    expect(feed.status().catchingUp).toBe(true);
+    // At most one probe per batch: every batch made one SOLUSDT fetch (it fails, so no retry rounds).
+    const solCalls = client.calls.filter((c) => symbolOf(c.url) === 'SOLUSDT').length;
+    const probes = client.calls.filter((c) => symbolOf(c.url) !== 'SOLUSDT').length;
+    expect(solCalls).toBeGreaterThanOrEqual(5);
+    expect(probes).toBe(solCalls);
+    for (const s of SYMS) client.failKlines(s, null);
+    await to(B1 + 75 * SEC);
+    expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([[B1, []]]);
+    expect(closes[0]!.bars.get('SOLUSDT')).toEqual(restBar(B0));
+    expect(closes[0]!.bars.get('BTCUSDT')).toEqual(streamBar(B0));
+    feed.stop();
+  });
+
+  it("a symbol's own earlier success in the batch is not evidence that REST is healthy", async () => {
+    const { client, feed, closes, to, pushAll } = setup();
+    // Batch 1 (B1 + 3.3 s): SOLUSDT's first fetch answers (no bar yet), its 1 s retry is malformed, and the probe is
+    // malformed too, so batch 1 must not count toward SOLUSDT's streak.
+    client.scriptKlines('SOLUSDT', 'empty', 'nonjson');
+    client.failKlines('BTCUSDT', 'nonjson');
+    client.failKlines('ETHUSDT', 'nonjson');
+    feed.start();
+    await to(B1 + 300);
+    pushAll(B0, ['BTCUSDT', 'ETHUSDT']);
+    await to(B1 + 6 * SEC);
+    expect(client.calls.filter((c) => symbolOf(c.url) === 'BTCUSDT')).toHaveLength(1); // the probe was sent
+    // From here REST is healthy and SOLUSDT alone is malformed: batches 2 (B1 + 10 s), 3 (+15 s), 4 (+20 s).
+    client.failKlines('BTCUSDT', null);
+    client.failKlines('ETHUSDT', null);
+    client.failKlines('SOLUSDT', 'nonjson');
+    await to(B1 + 17 * SEC);
+    expect(closes).toHaveLength(0); // streak 2 after batch 3: batch 1 did not count
+    await to(B1 + 22 * SEC);
+    expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([[B1, ['SOLUSDT']]]);
+    expect(closes[0]!.at).toBe(B1 + 20 * SEC);
+    feed.stop();
+  });
+
+  it('one probe per batch serves every malformed symbol, and it goes to a symbol that streamed', async () => {
+    const syms = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'];
+    // BTCUSDT already has B1's bar stored (first in the list, but it did not stream); ETHUSDT streams.
+    const { client, feed, closes, to, pushAll } = setup(syms, { BTCUSDT: B0 });
+    client.failKlines('SOLUSDT', 'nonjson');
+    client.failKlines('XRPUSDT', 'nonjson');
+    feed.start();
+    await to(B1 + 300);
+    pushAll(B0, ['ETHUSDT']);
+    await to(B1 + 40 * SEC);
+    expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([[B1, ['SOLUSDT', 'XRPUSDT']]]);
+    const probes = client.calls.filter((c) => symbolOf(c.url) !== 'SOLUSDT' && symbolOf(c.url) !== 'XRPUSDT');
+    expect(probes.map((c) => symbolOf(c.url))).toEqual(['ETHUSDT', 'ETHUSDT', 'ETHUSDT']);
+    feed.stop();
+  });
+
+  it('with no symbol streamed, the probe uses another symbol of the feed', async () => {
+    // B0 must come over REST; BTCUSDT and ETHUSDT already have it stored, so only SOLUSDT fetches.
+    const { client, feed, closes, to } = setup(SYMS, { SOLUSDT: B0 - 2 * STEP }, B0 - STEP);
+    client.failKlines('SOLUSDT', 'nonjson');
+    feed.start();
+    await to(START + 30 * SEC);
+    expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([[B0, ['SOLUSDT']]]);
+    const probes = client.calls.filter((c) => symbolOf(c.url) !== 'SOLUSDT');
+    expect(probes.length).toBe(3);
+    expect(probes.every((c) => limitOf(c.url) === '1')).toBe(true);
     feed.stop();
   });
 

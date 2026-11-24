@@ -43,6 +43,9 @@ export interface FakeConnection {
   onState: (s: 'open' | 'closed') => void;
 }
 
+/** A scripted kline reply: a status code, 'empty' (200, no bars), 'nonjson' (200, body not JSON) or a 200 with `body`. */
+export type KlineReply = number | 'empty' | 'nonjson' | { body: unknown };
+
 const tfBySymbolKey = (symbol: string, tf: Timeframe): string => `${symbol}|${tf}`;
 
 export class FakeExchange implements ExchangeClient {
@@ -55,8 +58,8 @@ export class FakeExchange implements ExchangeClient {
   private readonly candles = new Map<string, Candle[]>();
   private readonly funding = new Map<string, FundingEvent[]>();
   private readonly scripted: ScriptedResponse[] = [];
-  private readonly klineScripts = new Map<string, (number | 'empty' | 'nonjson')[]>();
-  private readonly klineFailures = new Map<string, number | 'nonjson'>();
+  private readonly klineScripts = new Map<string, KlineReply[]>();
+  private readonly klineFailures = new Map<string, number | 'nonjson' | { body: unknown }>();
   private readonly deps: PageDeps;
 
   constructor(private readonly o: FakeExchangeOptions) {
@@ -83,15 +86,15 @@ export class FakeExchange implements ExchangeClient {
   }
 
   /**
-   * Queue per-symbol kline replies: a status code, 'empty' for a 200 with no bars, or 'nonjson' for a 200 whose body
-   * is not JSON (a non-HTTP failure). Consumed before `script`.
+   * Queue per-symbol kline replies: a status code, 'empty' for a 200 with no bars, 'nonjson' for a 200 whose body
+   * is not JSON (a non-HTTP failure), or `{ body }` for a 200 with that body. Consumed before `script`.
    */
-  scriptKlines(symbol: string, ...replies: (number | 'empty' | 'nonjson')[]): void {
+  scriptKlines(symbol: string, ...replies: KlineReply[]): void {
     this.klineScripts.set(symbol, [...(this.klineScripts.get(symbol) ?? []), ...replies]);
   }
 
-  /** Every kline request for `symbol` returns `status` (or a non-JSON body) until called again with null. */
-  failKlines(symbol: string, status: number | 'nonjson' | null): void {
+  /** Every kline request for `symbol` returns `status` (a non-JSON body, or `{ body }`) until called again with null. */
+  failKlines(symbol: string, status: number | 'nonjson' | { body: unknown } | null): void {
     if (status === null) this.klineFailures.delete(symbol);
     else this.klineFailures.set(symbol, status);
   }
@@ -109,6 +112,8 @@ export class FakeExchange implements ExchangeClient {
         body = [];
       } else if (perSymbol === 'nonjson') {
         body = null;
+      } else if (typeof perSymbol === 'object') {
+        body = perSymbol.body;
       } else if (perSymbol !== undefined) {
         status = perSymbol;
         body = { msg: 'scripted' };

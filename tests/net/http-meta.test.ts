@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { EgressBlockedError, httpGet } from '../../src/net/http.js';
+import { EgressBlockedError, httpGet, httpGetJson, NetworkError } from '../../src/net/http.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -35,5 +35,35 @@ describe('httpGet', () => {
     const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}', { status: 200 }));
     await httpGet('https://fapi.binance.com/x');
     expect(spy.mock.calls[0]![1]).toMatchObject({ redirect: 'error' });
+  });
+});
+
+describe('NetworkError', () => {
+  it('wraps a fetch-level failure (DNS, reset, redirect) and keeps the cause', async () => {
+    const cause = new TypeError('fetch failed');
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(cause);
+    const err = await httpGet('https://fapi.binance.com/x').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(NetworkError);
+    expect((err as NetworkError).cause).toBe(cause);
+    await expect(httpGetJson('https://fapi.binance.com/x')).rejects.toBeInstanceOf(NetworkError);
+  });
+
+  it('wraps a timeout or abort', async () => {
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new DOMException('timed out', 'TimeoutError'));
+    await expect(httpGet('https://fapi.binance.com/x', { timeoutMs: 5 })).rejects.toBeInstanceOf(NetworkError);
+  });
+
+  it('wraps a connection lost while reading the body; a 200 that is not JSON is still a null body', async () => {
+    const broken = new Response('{}', { status: 200 });
+    vi.spyOn(broken, 'text').mockRejectedValue(new TypeError('terminated'));
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(broken)
+      .mockResolvedValueOnce(new Response('<html>', { status: 200 }));
+    await expect(httpGet('https://fapi.binance.com/x')).rejects.toBeInstanceOf(NetworkError);
+    expect((await httpGet('https://fapi.binance.com/x')).body).toBeNull();
+  });
+
+  it('never wraps a blocked host', async () => {
+    await expect(httpGet('https://example.com/x')).rejects.toBeInstanceOf(EgressBlockedError);
   });
 });

@@ -22,14 +22,41 @@ function assertAllowed(url: string): URL {
   return parsed;
 }
 
-function rawGet(parsed: URL, opts: { timeoutMs?: number }): Promise<Response> {
-  return fetch(parsed, {
-    method: 'GET',
-    // A redirect could leave the allowlist; fail instead of following it.
-    redirect: 'error',
-    headers: { accept: 'application/json' },
-    signal: AbortSignal.timeout(opts.timeoutMs ?? 15_000),
-  });
+/**
+ * The request never produced a complete reply: DNS, connection refused or reset, a refused redirect, an abort or a
+ * timeout, before or while the body was read. Says nothing about the request itself (`cause` holds the original error).
+ */
+export class NetworkError extends Error {
+  constructor(
+    public readonly url: string,
+    cause: unknown,
+  ) {
+    super(`network error for ${url}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = 'NetworkError';
+  }
+}
+
+async function rawGet(parsed: URL, opts: { timeoutMs?: number }): Promise<Response> {
+  try {
+    return await fetch(parsed, {
+      method: 'GET',
+      // A redirect could leave the allowlist; fail instead of following it.
+      redirect: 'error',
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(opts.timeoutMs ?? 15_000),
+    });
+  } catch (e) {
+    throw new NetworkError(`${parsed.hostname}${parsed.pathname}`, e);
+  }
+}
+
+/** The whole body as text; a connection lost (or timed out) mid-body is a NetworkError. */
+async function readText(res: Response, parsed: URL): Promise<string> {
+  try {
+    return await res.text();
+  } catch (e) {
+    throw new NetworkError(`${parsed.hostname}${parsed.pathname}`, e);
+  }
 }
 
 /**
@@ -40,10 +67,12 @@ export async function httpGet(
   url: string,
   opts: { timeoutMs?: number } = {},
 ): Promise<{ status: number; headers: Headers; body: unknown }> {
-  const res = await rawGet(assertAllowed(url), opts);
+  const parsed = assertAllowed(url);
+  const res = await rawGet(parsed, opts);
+  const text = await readText(res, parsed);
   let body: unknown = null;
   try {
-    body = await res.json();
+    body = JSON.parse(text);
   } catch {
     body = null;
   }
@@ -57,5 +86,5 @@ export async function httpGetJson<T>(url: string, opts: { timeoutMs?: number } =
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} from ${parsed.hostname}${parsed.pathname}`);
   }
-  return (await res.json()) as T;
+  return JSON.parse(await readText(res, parsed)) as T;
 }
