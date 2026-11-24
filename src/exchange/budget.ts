@@ -25,10 +25,14 @@ export interface BudgetOptions {
 
 /** Sliding 60 s window of charged weight, plus server-reported usage, 429 back-off and 418 ban. */
 export class RestBudget {
-  private events: { t: number; w: number }[] = [];
+  // Weight is charged per attempt, so a retried request after 429/418 is charged again. This is deliberate and
+  // conservative: we may wait slightly longer than needed, never go over the limit.
+  private events: { t: number; w: number; seq: number }[] = [];
+  private seq = 0;
   private pausedUntil = 0;
   private bannedUntil = 0;
-  private observed: { at: number; used: number } | null = null;
+  /** `seq` is the charge counter at observation time: charges with seq >= it came after the server's reading. */
+  private observed: { at: number; used: number; seq: number } | null = null;
 
   constructor(private readonly o: BudgetOptions) {}
 
@@ -50,10 +54,12 @@ export class RestBudget {
       while (this.events.length > 0 && this.events[0]!.t <= now - WINDOW_MS) this.events.shift();
       const local = this.events.reduce((s, e) => s + e.w, 0);
       const obs = this.observed && now - this.observed.at < WINDOW_MS ? this.observed : null;
-      const serverBound = obs !== null && obs.used > local;
-      const used = serverBound ? obs.used : local;
+      // The server's reading already includes charges made before it (and other processes' usage); add only what we charged since.
+      const serverTotal = obs === null ? 0 : obs.used + this.events.filter((e) => e.seq >= obs.seq).reduce((s, e) => s + e.w, 0);
+      const serverBound = obs !== null && serverTotal > local;
+      const used = serverBound ? serverTotal : local;
       if (used + weight <= this.o.limitPerMin) {
-        this.events.push({ t: now, w: weight });
+        this.events.push({ t: now, w: weight, seq: this.seq++ });
         return;
       }
       const freeAt = serverBound ? obs.at + WINDOW_MS : (this.events[0]?.t ?? now) + WINDOW_MS;
@@ -63,7 +69,7 @@ export class RestBudget {
 
   /** Record the server's X-MBX-USED-WEIGHT-1M. */
   observe(usedWeight1m: number): void {
-    if (Number.isFinite(usedWeight1m) && usedWeight1m >= 0) this.observed = { at: this.o.now(), used: usedWeight1m };
+    if (Number.isFinite(usedWeight1m) && usedWeight1m >= 0) this.observed = { at: this.o.now(), used: usedWeight1m, seq: this.seq };
   }
 
   /** HTTP 429: pause all acquires for `ms`. */

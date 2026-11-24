@@ -88,6 +88,47 @@ describe('loadHistory', () => {
     expect(contiguous(repo.range(SYM, '1h', 0, Number.MAX_SAFE_INTEGER))).toBe(true);
   });
 
+  it('backfills the head: 100 stored, 3000 wanted reports available 3000', async () => {
+    const { client, repo, load } = setup();
+    client.setCandles(SYM, '1h', series(5000));
+    repo.upsert(SYM, '1h', series(100, LAST_CLOSED, false));
+    expect(await load(3000)).toEqual({ loaded: 2900, available: 3000 });
+    expect(contiguous(repo.range(SYM, '1h', 0, Number.MAX_SAFE_INTEGER))).toBe(true);
+  });
+
+  it('does not chase the head past onboardDate, and a young pair does not refetch forever', async () => {
+    const { client, repo, clock, load } = setup();
+    client.setCandles(SYM, '1h', series(800));
+    const onboardDate = LAST_CLOSED - 799 * H;
+    const run = () =>
+      loadHistory({ client, repo, symbol: SYM, tf: '1h', bars: 3000, now: clock.now(), onboardDate });
+    expect(await run()).toEqual({ loaded: 800, available: 800 });
+    const calls = client.calls.length;
+    expect(await run()).toEqual({ loaded: 0, available: 800 });
+    expect(client.calls.length).toBe(calls); // already current, head limited by the listing date, no holes
+    void load;
+  });
+
+  it('fills a 10-bar interior hole with one load', async () => {
+    const { client, repo, load } = setup();
+    const all = series(500, LAST_CLOSED, false);
+    client.setCandles(SYM, '1h', all);
+    repo.upsert(SYM, '1h', all.filter((_, i) => i < 200 || i >= 210));
+    expect(await load(500)).toEqual({ loaded: 10, available: 500 });
+    expect(contiguous(repo.range(SYM, '1h', 0, Number.MAX_SAFE_INTEGER))).toBe(true);
+  });
+
+  it('a genuine exchange gap is refetched once per load, not looped', async () => {
+    const { client, load } = setup();
+    const all = series(300, LAST_CLOSED, false).filter((_, i) => i < 100 || i >= 105);
+    client.setCandles(SYM, '1h', all);
+    const res = await load(300);
+    expect(res.available).toBe(295);
+    const first = client.calls.length;
+    await load(300);
+    expect(client.calls.length - first).toBeLessThanOrEqual(2); // at most the one bounded window refetch
+  });
+
   it('retention: chart keeps bars + 500, higher timeframe keeps 1050', async () => {
     const chart = setup();
     chart.client.setCandles(SYM, '1h', series(5000));

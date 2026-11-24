@@ -20,12 +20,14 @@ const toCandle = (r: CandleRow): Candle => ({
 });
 
 function inTransaction(db: DatabaseSync, fn: () => void): void {
-  db.exec('BEGIN');
+  // SAVEPOINT nests safely inside a caller's transaction (and starts one when there is none).
+  db.exec('SAVEPOINT pineapple_repo');
   try {
     fn();
-    db.exec('COMMIT');
+    db.exec('RELEASE pineapple_repo');
   } catch (e) {
-    db.exec('ROLLBACK');
+    db.exec('ROLLBACK TO pineapple_repo');
+    db.exec('RELEASE pineapple_repo');
     throw e;
   }
 }

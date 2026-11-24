@@ -35,7 +35,7 @@ async function main(): Promise<void> {
   const outDir = values.out ?? 'data';
 
   const client = new BinanceClient(); // paces every request through the REST weight budget
-  const candlePath =join(outDir, `${symbol}_${tf}.csv`);
+  const candlePath = join(outDir, `${symbol}_${tf}.csv`);
   const fundingPath = join(outDir, `${symbol}_funding.csv`);
 
   console.log(`Fetching ${symbol} ${tf} klines ${values.from} -> ${values.to} ...`);

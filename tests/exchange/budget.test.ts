@@ -32,6 +32,15 @@ describe('RestBudget', () => {
     expect(clock.now() - t0).toBeGreaterThanOrEqual(60_000);
   });
 
+  it('server floor counts our later charges: observe(1000) then 50 concurrent acquire(10)', async () => {
+    const { clock, budget } = mkBudget();
+    const t0 = clock.now();
+    budget.observe(1000);
+    const done: number[] = [];
+    await Promise.all(Array.from({ length: 50 }, () => budget.acquire(10).then(() => done.push(clock.now()))));
+    expect(done.filter((t) => t < t0 + 60_000).length).toBeLessThanOrEqual(20);
+  });
+
   it('backoff pauses the next acquire for the full duration', async () => {
     const { clock, budget } = mkBudget();
     budget.backoff(5000);
@@ -102,6 +111,12 @@ describe('BinanceClient REST', () => {
     const clock = makeClock();
     const budget = new RestBudget({ limitPerMin: 1200, now: clock.now, sleep: clock.sleep });
     const urls: string[] = [];
+    const weights: number[] = [];
+    const realAcquire = budget.acquire.bind(budget);
+    budget.acquire = (w: number) => {
+      weights.push(w);
+      return realAcquire(w);
+    };
     const client = new BinanceClient({
       budget,
       now: clock.now,
@@ -114,9 +129,13 @@ describe('BinanceClient REST', () => {
     await client.fundingHistory('BTCUSDT', 0, 1);
     expect(urls[0]).toContain('limit=1500');
     expect(urls[1]).toContain('/fapi/v1/fundingRate');
-    // the 1190 reading from the first response makes the funding call (weight 1) fine but the next heavy one must wait
+    // Server reported 1190 used after the funding call (weight 1 charged on top of the 10 for klines):
+    // the server floor is 1190 + 0 later charges, so a weight-20 call must wait out the 60 s window.
     const t0 = clock.now();
     await budget.acquire(20);
-    expect(clock.now() - t0).toBeGreaterThan(0);
+    expect(clock.now() - t0).toBeGreaterThanOrEqual(59_000);
+    expect(clock.now() - t0).toBeLessThanOrEqual(60_000);
+    // 1500-bar kline page costs 10; funding costs 1 (the spy saw both before our own acquire(20)).
+    expect(weights.slice(0, 2)).toEqual([10, 1]);
   });
 });

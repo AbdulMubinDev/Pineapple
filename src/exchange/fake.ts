@@ -47,7 +47,7 @@ export class FakeExchange implements ExchangeClient {
     this.deps = { getJson: (url, weight) => this.getJson(url, weight), now: o.now };
   }
 
-  /** Total weight charged so far, retried attempts included. */
+  /** Total weight charged so far; each retried attempt is charged again (deliberately conservative). */
   get weightCharged(): number {
     return this.calls.reduce((s, c) => s + c.weight, 0);
   }
