@@ -34,6 +34,8 @@ export const MISSING_RETRY_MS: readonly number[] = [1_000, 2_000, 3_000];
 export const RETRY_DEADLINE_MS = 9_500;
 /** The same non-HTTP failure for one symbol on this many batches in a row marks it missing instead of failing the batch. */
 export const ERROR_STREAK_LIMIT = 3;
+/** Time a retry round's fetches are allowed before the deadline; a round that would not fit is skipped. */
+export const FETCH_ALLOWANCE_MS = 1_000;
 /**
  * A gap behind the batch of at most this many bars is fetched and written with it (one small request). A repo further
  * behind is loadHistory's to repair: the feed still emits the bars but does not store them past the hole.
@@ -133,6 +135,14 @@ interface SymbolPlan {
   bars: Map<number, Candle>;
   /** REST rejected this symbol for this batch: no retries. */
   permanent: boolean;
+  /** Its retry round hit the deadline: later replies are ignored for this batch. */
+  sealed: boolean;
+}
+
+interface RoundResult {
+  ok: number;
+  transient: { e: unknown } | null;
+  odd: Map<SymbolPlan, unknown>;
 }
 
 type Rec = Record<string, unknown>;
@@ -140,23 +150,11 @@ const isRec = (v: unknown): v is Rec => typeof v === 'object' && v !== null;
 const num = (v: unknown): number => (typeof v === 'string' && v.trim() !== '' ? Number(v) : typeof v === 'number' ? v : NaN);
 /** A 4xx other than 429/418: this request is wrong for this symbol, retrying will not help. */
 const isPermanent = (e: unknown): boolean => e instanceof HttpStatusError && e.status >= 400 && e.status < 500 && e.status !== 429 && e.status !== 418;
-
-async function forEachLimit<T>(items: T[], limit: number, fn: (t: T) => Promise<void>): Promise<void> {
-  let i = 0;
-  let failure: { e: unknown } | null = null;
-  const worker = async (): Promise<void> => {
-    while (i < items.length && failure === null) {
-      const t = items[i++]!;
-      try {
-        await fn(t);
-      } catch (e) {
-        failure ??= { e };
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  if (failure !== null) throw (failure as { e: unknown }).e;
-}
+/** Failures that say nothing about one symbol: other HTTP statuses (5xx, 429, 418) and fetch-level errors (DNS, reset, timeout). */
+const isNetworkWide = (e: unknown): boolean =>
+  e instanceof HttpStatusError ||
+  e instanceof TypeError ||
+  (typeof e === 'object' && e !== null && ['AbortError', 'TimeoutError'].includes((e as { name?: unknown }).name as string));
 
 /**
  * Live data for one chart timeframe: closed klines for its own symbols, plus last and mark prices for them.
@@ -604,7 +602,7 @@ export class LiveFeed {
       const b = this.pending.get(t + step)?.bars.get(s);
       if (b) bars.set(t, b);
     }
-    return { symbol: s, from, storable, bars, permanent: false };
+    return { symbol: s, from, storable, bars, permanent: false, sealed: false };
   }
 
   /** Any open in [from, hi] without a bar (`batchOnly`: only the opens being emitted, [lo, hi]). */
@@ -613,26 +611,80 @@ export class LiveFeed {
     return false;
   }
 
-  /** One REST fetch for [from, hi]. Permanent failures mark the symbol missing; transient ones throw. */
+  /** One REST fetch for [from, hi] into the plan. Throws what the client throws. A sealed plan ignores late results. */
   private async fetchInto(p: SymbolPlan, hi: number): Promise<void> {
     if (p.from > hi) return;
     this.inCatchUp = true;
-    let fetched: Candle[];
-    try {
-      fetched = await this.o.client.klines(p.symbol, this.o.tf, p.from, hi);
-    } catch (e) {
-      if (!isPermanent(e)) {
-        const streak = (this.errorStreak.get(p.symbol) ?? 0) + 1;
-        this.errorStreak.set(p.symbol, streak);
-        // The same non-HTTP failure for one symbol, batch after batch (e.g. a malformed reply), stops stalling everyone.
-        if (e instanceof HttpStatusError || streak < ERROR_STREAK_LIMIT) throw e;
-      }
-      this.report(e);
-      p.permanent = true;
-      return;
-    }
-    this.errorStreak.delete(p.symbol);
+    const fetched = await this.o.client.klines(p.symbol, this.o.tf, p.from, hi);
+    if (p.sealed) return;
     for (const c of fetched) if (c.openTime >= p.from && c.openTime <= hi && !p.bars.has(c.openTime)) p.bars.set(c.openTime, c);
+  }
+
+  /**
+   * One round of fetches. A 4xx marks that symbol missing; a network-wide failure stops new fetches and is returned;
+   * any other error is collected per symbol. With `until`, the round is abandoned at that time: symbols still in flight
+   * keep their holes (and are sealed, so a late reply changes nothing).
+   */
+  private async fetchRound(plans: SymbolPlan[], hi: number, until?: number): Promise<RoundResult> {
+    const res: RoundResult = { ok: 0, transient: null, odd: new Map() };
+    let i = 0;
+    let abandoned = false;
+    const worker = async (): Promise<void> => {
+      while (i < plans.length && res.transient === null && !abandoned) {
+        const p = plans[i++]!;
+        try {
+          await this.fetchInto(p, hi);
+          if (p.sealed) continue;
+          res.ok++;
+          this.errorStreak.delete(p.symbol);
+        } catch (e) {
+          if (p.sealed) continue;
+          if (isPermanent(e)) {
+            this.report(e);
+            p.permanent = true;
+          } else if (isNetworkWide(e)) res.transient ??= { e };
+          else res.odd.set(p, e);
+        }
+      }
+    };
+    const all = Promise.all(Array.from({ length: Math.min(REST_CONCURRENCY, plans.length) }, worker));
+    if (until === undefined) {
+      await all;
+      return res;
+    }
+    let done = false;
+    void all.then(() => (done = true));
+    const wait = until - this.o.now();
+    if (wait > 0) await Promise.race([all, this.sleep(wait)]);
+    if (!done) {
+      abandoned = true;
+      for (const p of plans) p.sealed = true;
+    }
+    return res;
+  }
+
+  /**
+   * Decide a round: a network-wide failure fails the batch. Another error counts toward that symbol's streak only when
+   * some other symbol's fetch succeeded in this batch (so it is that symbol, not the network); at ERROR_STREAK_LIMIT the
+   * symbol is marked missing, below it the batch fails and is retried.
+   */
+  private settleRound(r: RoundResult, okInBatch: number): void {
+    if (r.transient !== null) throw r.transient.e;
+    if (r.odd.size === 0) return;
+    const [first] = r.odd.values();
+    if (okInBatch === 0) throw first;
+    let rethrow: { e: unknown } | null = null;
+    for (const [p, e] of r.odd) {
+      const streak = (this.errorStreak.get(p.symbol) ?? 0) + 1;
+      this.errorStreak.set(p.symbol, streak);
+      if (streak >= ERROR_STREAK_LIMIT) {
+        this.report(e);
+        p.permanent = true;
+      } else {
+        rethrow ??= { e };
+      }
+    }
+    if (rethrow !== null) throw rethrow.e;
   }
 
   /** Write and fire every close in (lastEmitted, target], oldest first. Throws (writing nothing) on a transient failure. */
@@ -644,25 +696,31 @@ export class LiveFeed {
     const lo = closes[0]! - step;
     const hi = target - step;
     if (catchUp || closes.length > 1) this.inCatchUp = true;
-    // Retries end by the pass deadline, counted from the first kline of the oldest close in the batch (else from now).
+    // Retries end by the pass deadline: from the first kline of the oldest close in the batch, else from the newest close.
     const firsts = closes.map((c) => this.pending.get(c)?.firstAt).filter((t): t is number => t !== undefined);
-    const deadline = (firsts.length > 0 ? Math.min(...firsts) : this.o.now()) + RETRY_DEADLINE_MS;
+    const deadline = (firsts.length > 0 ? Math.min(...firsts) : closes.at(-1)!) + RETRY_DEADLINE_MS;
 
     const symbols = [...this.symbols];
     const plans = symbols.map((s) => this.planSymbol(s, lo, hi));
-    // One fetch for every symbol with a hole anywhere it may write (gap fill included).
-    await forEachLimit(
+    // One fetch for every symbol with a hole anywhere it may write (gap fill included). Not cut by the deadline: a
+    // slow or failing REST here is a network problem, and a close never fires without bars REST could still give.
+    let okInBatch = 0;
+    const first = await this.fetchRound(
       plans.filter((p) => this.hasHoles(p, lo, hi, false)),
-      REST_CONCURRENCY,
-      (p) => this.fetchInto(p, hi),
+      hi,
     );
-    // Retry rounds, shared by the whole batch, only for bars being emitted that REST did not have yet.
+    okInBatch += first.ok;
+    this.settleRound(first, okInBatch);
+    // Retry rounds, shared by the whole batch, only for bars being emitted that REST did not have yet, each bounded by
+    // the deadline (a round starts only if its sleep plus FETCH_ALLOWANCE_MS fits).
     for (const delay of MISSING_RETRY_MS) {
-      const waiting = plans.filter((p) => !p.permanent && this.hasHoles(p, lo, hi, true));
-      if (waiting.length === 0 || !this.running || this.o.now() + delay > deadline) break;
+      const waiting = plans.filter((p) => !p.permanent && !p.sealed && this.hasHoles(p, lo, hi, true));
+      if (waiting.length === 0 || !this.running || this.o.now() + delay + FETCH_ALLOWANCE_MS > deadline) break;
       await this.sleep(delay);
       if (!this.running) break;
-      await forEachLimit(waiting, REST_CONCURRENCY, (p) => this.fetchInto(p, hi));
+      const r = await this.fetchRound(waiting, hi, deadline);
+      okInBatch += r.ok;
+      this.settleRound(r, okInBatch);
     }
     if (!this.running) return;
 

@@ -337,6 +337,8 @@ describe('LiveFeed', () => {
     expect(closes[0]!.at).toBeLessThanOrEqual(B1 + 10 * SEC);
     expect(errors.some((e) => e instanceof MissingBarsError && e.symbols.join() === 'SOLUSDT' && e.closeTime === B1)).toBe(true);
     expect(feed.status().missing).toEqual(['SOLUSDT']);
+    // First fetch plus 2 retry rounds; the 3 s round would not fit its fetch allowance before the deadline.
+    expect(client.calls.filter((c) => c.url.includes('SOLUSDT'))).toHaveLength(3);
     feed.stop();
   });
 
@@ -535,17 +537,115 @@ describe('LiveFeed', () => {
     feed.stop();
   });
 
-  it('a non-HTTP failure repeating for one symbol on 3 batches marks it missing instead of stalling closes', async () => {
+  it('a network-wide outage holds closes until REST is back, then emits them complete and in order', async () => {
+    const warm = { BTCUSDT: B0 - 2 * STEP, ETHUSDT: B0 - 2 * STEP, SOLUSDT: B0 - 2 * STEP };
+    const { clock, client, feed, closes, to } = setup(SYMS, warm, B0 - STEP); // resumes one close behind
+    const outageEnd = START + 30 * SEC;
+    const real = client.klines.bind(client);
+    client.klines = (...a) => (clock.now() < outageEnd ? Promise.reject(new TypeError('fetch failed')) : real(...a));
+    feed.start();
+    await to(outageEnd - 1);
+    expect(closes).toHaveLength(0); // never emitted without bars, however many batches failed
+    expect(feed.status().catchingUp).toBe(true);
+    await to(outageEnd + 10 * SEC);
+    expect(closes.map((c) => c.closeTime)).toEqual([B0]);
+    // B1's klines never arrive either: caught up over REST once overdue.
+    await to(B1 + 40 * SEC);
+    expect(closes.map((c) => c.closeTime)).toEqual([B0, B1]);
+    for (const c of closes) {
+      expect(c.missing).toEqual([]);
+      expect(c.bars.size).toBe(3);
+    }
+    feed.stop();
+  });
+
+  it('a fetch-level error on one symbol never marks it missing, even while others fetch fine', async () => {
+    const { clock, client, feed, closes, to, pushAll } = setup();
+    const outageEnd = B1 + 60 * SEC;
+    const real = client.klines.bind(client);
+    client.klines = (s, ...rest) =>
+      s === 'SOLUSDT' && clock.now() < outageEnd ? Promise.reject(new TypeError('fetch failed')) : real(s, ...rest);
+    feed.start();
+    await to(B1 + 300);
+    pushAll(B0, ['BTCUSDT']); // ETHUSDT over REST succeeds every batch
+    await to(outageEnd - 1);
+    expect(closes).toHaveLength(0);
+    await to(outageEnd + 10 * SEC);
+    expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([[B1, []]]);
+    expect(closes[0]!.bars.get('SOLUSDT')).toEqual(restBar(B0));
+    feed.stop();
+  });
+
+  it('the same odd error on every symbol at once is not blamed on any one of them', async () => {
+    const warm = { BTCUSDT: B0 - 2 * STEP, ETHUSDT: B0 - 2 * STEP, SOLUSDT: B0 - 2 * STEP };
+    const { clock, client, feed, closes, to } = setup(SYMS, warm, B0 - STEP); // B0's bars must come over REST
+    for (const s of SYMS) client.failKlines(s, 'nonjson');
+    feed.start();
+    await to(START + 30 * SEC);
+    expect(closes).toHaveLength(0);
+    for (const s of SYMS) client.failKlines(s, null);
+    await to(clock.now() + 10 * SEC);
+    expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([[B0, []]]);
+    feed.stop();
+  });
+
+  it('a slow fetch in the last retry round is cut at the deadline', async () => {
+    const { timers, client, feed, closes, to, pushAll } = setup();
+    client.setCandles('SOLUSDT', TF, []);
+    const real = client.klines.bind(client);
+    let solCalls = 0;
+    client.klines = async (s, ...rest) => {
+      if (s === 'SOLUSDT' && ++solCalls === 3) await new Promise((r) => timers.setTimer(r, 5 * SEC));
+      return real(s, ...rest);
+    };
+    feed.start();
+    await to(B1 + 300);
+    pushAll(B0, ['BTCUSDT', 'ETHUSDT']);
+    await to(B1 + 20 * SEC);
+    expect(closes).toHaveLength(1);
+    expect(closes[0]!.missing).toEqual(['SOLUSDT']);
+    expect(closes[0]!.at).toBeLessThanOrEqual(B1 + 300 + 10 * SEC);
+    expect(solCalls).toBe(3);
+    feed.stop();
+  });
+
+  it('lost klines plus a slow REST call still emit by about C + 10 s', async () => {
+    const { timers, client, feed, closes, to, pushAll } = setup();
+    feed.start();
+    const B2 = B1 + STEP;
+    for (let t = START + 30 * SEC; t <= B2; t += 30 * SEC) {
+      await to(t);
+      client.pushKline('BTCUSDT', TF, streamBar(barOpenFor(t, TF)), false);
+      if (t === B1) pushAll(B0);
+    }
+    client.setCandles('SOLUSDT', TF, []);
+    const real = client.klines.bind(client);
+    let solCalls = 0;
+    client.klines = async (s, ...rest) => {
+      if (s === 'SOLUSDT' && ++solCalls === 1) await new Promise((r) => timers.setTimer(r, 5 * SEC));
+      return real(s, ...rest);
+    };
+    await to(B2 + SEC);
+    feed.setSymbols([...SYMS]); // new generation; B2's closed klines are lost in the switch
+    await to(B2 + 20 * SEC);
+    expect(closes.map((c) => c.closeTime)).toEqual([B1, B2]);
+    expect(closes[1]!.missing).toEqual(['SOLUSDT']);
+    expect(closes[1]!.at).toBeLessThanOrEqual(B2 + 10 * SEC);
+    feed.stop();
+  });
+
+  it('a malformed reply for one symbol while others fetch fine marks it missing after 3 batches', async () => {
     const { client, feed, closes, to, pushAll } = setup();
     client.failKlines('SOLUSDT', 'nonjson');
     feed.start();
     await to(B1 + 300);
-    pushAll(B0, ['BTCUSDT', 'ETHUSDT']);
+    pushAll(B0, ['BTCUSDT']); // ETHUSDT comes over REST and succeeds: the failure is SOLUSDT's own
     await to(B1 + 40 * SEC);
     expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([[B1, ['SOLUSDT']]]);
+    expect(closes[0]!.bars.get('ETHUSDT')).toEqual(restBar(B0));
     const B2 = B1 + STEP;
     await to(B2 + 300);
-    pushAll(B1, ['BTCUSDT', 'ETHUSDT']);
+    pushAll(B1, ['BTCUSDT']);
     await to(B2 + 3500);
     expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([
       [B1, ['SOLUSDT']],
