@@ -1,6 +1,7 @@
 import { barOpenFor, tfToMs } from '../core/timeframe.js';
 import type { Candle, Timeframe } from '../core/types.js';
 import type { CandleRepo } from '../store/candles.js';
+import { HttpStatusError } from './budget.js';
 import type { ExchangeClient, MarkUpdate } from './client.js';
 
 /** Binance allows 1024; 200 keeps each subscription URL short and a single dropped socket cheap. */
@@ -9,22 +10,32 @@ export const STREAMS_PER_CONNECTION = 200;
 export const CLOSE_WAIT_MS = 3_000;
 /** No closed kline for a close by close + this: the feed is stale, the close is fetched over REST and sockets reconnect. */
 export const STALE_GRACE_MS = 30_000;
-/** A connection with no message at all for this long is dead (the !ticker@arr / kline streams send every second or so). */
+/** A connection with no message, or the whole feed with no kline event, for this long is dead (both stream ~every second). */
 export const SILENCE_MS = 60_000;
-/** Binance drops a connection at 24 h; rotate before that. */
+/** Binance drops a connection at 24 h; rotate (make-before-break) before that. */
 export const ROTATE_MS = 23 * 3_600_000;
 /** A connection that has not opened by then is abandoned and retried. */
 export const OPEN_TIMEOUT_MS = 10_000;
 export const RECONNECT_MIN_MS = 1_000;
 export const RECONNECT_MAX_MS = 60_000;
-/** After a failed backfill, wait this long before trying again. */
+/** After a failed (transient) backfill, wait this long before trying again. */
 export const RETRY_MS = 5_000;
 /** A REST catch-up only targets closes at least this old, so the exchange has published the bar. */
 export const REST_SETTLE_MS = 3_000;
+/**
+ * REST returned no bar for a symbol: retry after these delays. 3 s wait + 6 s of retries keeps the close inside the
+ * 10 s pass deadline.
+ */
+export const MISSING_RETRY_MS: readonly number[] = [1_000, 2_000, 3_000];
+/**
+ * A gap behind the batch of at most this many bars is fetched and written with it (one small request). A repo further
+ * behind is loadHistory's to repair: the feed still emits the bars but does not store them past the hole.
+ */
+export const GAP_FILL_BARS = 99;
 const TICK_MS = 5_000;
 const REST_CONCURRENCY = 8;
 
-export type CloseListener = (closeTime: number, bars: Map<string, Candle>) => void | Promise<unknown>;
+export type CloseListener = (closeTime: number, bars: Map<string, Candle>, missing: string[]) => void | Promise<unknown>;
 
 export interface LiveFeedOptions {
   client: ExchangeClient;
@@ -33,6 +44,8 @@ export interface LiveFeedOptions {
   symbols: string[];
   now: () => number;
   setTimer: typeof setTimeout;
+  /** Used by stop() to cancel pending timers. Without it, stopped timers fire and do nothing. */
+  clearTimer?: typeof clearTimeout;
   /**
    * The last close already handled (a bar boundary, UTC epoch ms). Closes after it are emitted, backfilled over REST
    * when the stream missed them. Default: the last boundary at or before `now()` at construction.
@@ -45,12 +58,49 @@ export interface LiveFeedStatus {
   stale: boolean;
   lastMessageAt: number;
   catchingUp: boolean;
+  /** Symbols with no bar in the last emitted close (REST had none, or rejected the request). */
+  missing: string[];
+}
+
+/** A close fired without some symbols' bars. */
+export class MissingBarsError extends Error {
+  constructor(
+    public readonly closeTime: number,
+    public readonly symbols: string[],
+  ) {
+    super(`close ${new Date(closeTime).toISOString()}: no bar for ${symbols.join(', ')}`);
+    this.name = 'MissingBarsError';
+  }
+}
+
+/** A symbol's stored history ends too far back to join the live bars; loadHistory must repair it. */
+export class RepoBehindError extends Error {
+  constructor(
+    public readonly symbol: string,
+    public readonly latestOpenTime: number,
+  ) {
+    super(`${symbol}: stored history ends at ${new Date(latestOpenTime).toISOString()}, too far behind to extend`);
+    this.name = 'RepoBehindError';
+  }
 }
 
 interface Conn {
+  chunk: string[];
   sub: { close(): void } | null;
   open: boolean;
+  /** Bumped on every (re)open, so callbacks from an older socket are ignored. */
+  epoch: number;
+  startedAt: number;
   lastMsg: number;
+  attempts: number;
+  retryPending: boolean;
+}
+
+interface Gen {
+  id: number;
+  conns: Conn[];
+  /** When every connection of this generation was first open at once (0 until then). */
+  allOpenAt: number;
 }
 
 interface PendingClose {
@@ -61,6 +111,8 @@ interface PendingClose {
 type Rec = Record<string, unknown>;
 const isRec = (v: unknown): v is Rec => typeof v === 'object' && v !== null;
 const num = (v: unknown): number => (typeof v === 'string' && v.trim() !== '' ? Number(v) : typeof v === 'number' ? v : NaN);
+/** A 4xx other than 429/418: this request is wrong for this symbol, retrying will not help. */
+const isPermanent = (e: unknown): boolean => e instanceof HttpStatusError && e.status >= 400 && e.status < 500 && e.status !== 429 && e.status !== 418;
 
 async function forEachLimit<T>(items: T[], limit: number, fn: (t: T) => Promise<void>): Promise<void> {
   let i = 0;
@@ -84,13 +136,16 @@ async function forEachLimit<T>(items: T[], limit: number, fn: (t: T) => Promise<
  * One close event per bar boundary, in order, each exactly once (`lastEmitted` is the high-water mark).
  *
  * - Closed klines are buffered per close. The close fires when every symbol has arrived, or CLOSE_WAIT_MS after the
- *   first one; still-missing symbols are fetched over REST.
- * - Before a close fires, each symbol's bars are written to the repo in one transaction, together with any gap behind
- *   them (fetched over REST first), so a stream bar is never stored past a hole.
- * - Stale: no closed kline for a close by close + STALE_GRACE_MS, or a connection silent for SILENCE_MS. Missed closes
- *   are fetched over REST and fired in order; sockets reconnect with backoff. Stale clears once messages flow on the
- *   current connections and every due close has fired.
- * - Connections rotate every ROTATE_MS. A dropped connection reconnects with exponential backoff.
+ *   first one; still-missing symbols are fetched over REST, retried (MISSING_RETRY_MS) when REST has no bar yet, and
+ *   reported in `missing` if they never appear. A 4xx for one symbol marks it missing; transient errors (5xx, network,
+ *   429/418) fail the batch, which writes nothing and is retried.
+ * - Before a close fires, each symbol's bars are written with any small gap behind them (GAP_FILL_BARS), all symbols
+ *   in one transaction. Nothing is ever stored past a hole.
+ * - Stale: no closed kline for a close by close + STALE_GRACE_MS, a connection silent for SILENCE_MS, or no kline event
+ *   at all for SILENCE_MS. Missed closes are fetched over REST and fired in order; sockets reconnect. Stale clears only
+ *   on a kline event from the current connections, once every due close has fired.
+ * - A dropped connection reopens on its own, with its own backoff. Rotation (ROTATE_MS) and setSymbols are
+ *   make-before-break. After any open, a catch-up is scheduled for the next boundary + REST_SETTLE_MS.
  */
 export class LiveFeed {
   private symbols: Set<string>;
@@ -98,21 +153,25 @@ export class LiveFeed {
   private lastEmitted: number;
   private queuedTarget: number;
   private readonly pending = new Map<number, PendingClose>();
-  private conns: Conn[] = [];
-  private gen = 0;
+  private cur: Gen | null = null;
+  private old: Gen | null = null;
+  private genSeq = 0;
+  /** Bumped by start() and stop(); timers from another life do nothing. */
+  private life = 0;
   private running = false;
-  private connected = false;
-  private connectStartedAt = 0;
-  private openedAt = 0;
-  private msgSinceOpen = false;
   private lastMessageAt = 0;
+  private lastKlineAt = 0;
+  private lastCurKlineAt = 0;
   private stale = false;
+  private staleSince = 0;
   private inCatchUp = false;
   private failedAt: number | null = null;
-  private attempts = 0;
-  private reconnectPending = false;
+  private lastMissing: string[] = [];
+  private readonly reportedBehind = new Set<string>();
   private lastStaleReconnectAt = -Infinity;
   private work: Promise<void> = Promise.resolve();
+  private readonly timers = new Set<ReturnType<typeof setTimeout>>();
+  private readonly sleepers = new Set<() => void>();
   private readonly closeListeners: CloseListener[] = [];
   private readonly priceListeners: ((symbol: string, last: number, time: number) => void)[] = [];
   private readonly markListeners: ((m: MarkUpdate) => void)[] = [];
@@ -139,7 +198,7 @@ export class LiveFeed {
     return this.listen(this.markListeners, cb);
   }
 
-  /** Backfill failures and listener exceptions. The feed keeps going (and retries backfills). */
+  /** Backfill failures, MissingBarsError, RepoBehindError and listener exceptions. The feed keeps going. */
   onError(cb: (e: unknown) => void): () => void {
     return this.listen(this.errorListeners, cb);
   }
@@ -147,40 +206,85 @@ export class LiveFeed {
   start(): void {
     if (this.running) return;
     this.running = true;
-    this.connect(); // also starts the watchdog tick for this generation
+    const life = ++this.life;
+    this.lastKlineAt = this.o.now();
+    this.connect(false);
+    this.armTick(life);
   }
 
   stop(): void {
     if (!this.running) return;
     this.running = false;
-    this.closeConns();
-    this.gen++;
-    this.connected = false;
+    this.life++;
+    this.closeGen(this.old);
+    this.closeGen(this.cur);
+    this.old = this.cur = null;
     this.pending.clear();
+    this.queuedTarget = this.lastEmitted;
+    if (this.o.clearTimer) for (const t of this.timers) this.o.clearTimer(t);
+    this.timers.clear();
+    for (const wake of [...this.sleepers]) wake();
   }
 
-  /** Replace this feed's symbols and reconnect with the new stream list. Other timeframes' feeds are untouched. */
+  /** Replace this feed's symbols; new connections open before the old ones close. Other timeframes' feeds are untouched. */
   setSymbols(symbols: string[]): void {
     const wasEmpty = this.symbols.size === 0;
     this.symbols = new Set(symbols);
     for (const p of this.pending.values()) for (const s of [...p.bars.keys()]) if (!this.symbols.has(s)) p.bars.delete(s);
     // An empty feed emits nothing, so it has no backlog to catch up when symbols arrive.
     if (wasEmpty) this.lastEmitted = this.queuedTarget = Math.max(this.lastEmitted, barOpenFor(this.o.now(), this.o.tf));
-    if (this.running) this.connect();
+    if (this.running) this.connect(true);
   }
 
   status(): LiveFeedStatus {
     return {
-      connected: this.connected,
+      connected: this.isConnected(),
       stale: this.stale,
       lastMessageAt: this.lastMessageAt,
       catchingUp: this.inCatchUp || this.failedAt !== null || this.overdue(),
+      missing: [...this.lastMissing],
     };
   }
 
   /** Resolves when queued close work has finished. */
   settled(): Promise<void> {
     return this.work;
+  }
+
+  // --- timers ------------------------------------------------------------------------------------------------
+
+  /** setTimer bound to this life: the callback does nothing once the feed has stopped (or restarted). */
+  private timer(fn: () => void, ms: number): void {
+    const life = this.life;
+    const handle = this.o.setTimer(() => {
+      this.timers.delete(handle);
+      if (this.running && life === this.life) fn();
+    }, Math.max(0, ms));
+    this.timers.add(handle);
+  }
+
+  /** Resolves after `ms`, or at once when the feed stops (callers check `running`), so close work never hangs. */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const wake = (): void => {
+        this.sleepers.delete(wake);
+        resolve();
+      };
+      this.sleepers.add(wake);
+      const handle = this.o.setTimer(() => {
+        this.timers.delete(handle);
+        wake();
+      }, ms);
+      this.timers.add(handle);
+    });
+  }
+
+  private armTick(life: number): void {
+    this.timer(() => {
+      if (life !== this.life) return;
+      this.check();
+      this.armTick(life);
+    }, TICK_MS);
   }
 
   // --- connections -------------------------------------------------------------------------------------------
@@ -191,84 +295,126 @@ export class LiveFeed {
     return ['!ticker@arr', '!markPrice@arr@1s', ...klines];
   }
 
-  private closeConns(): void {
-    for (const c of this.conns) c.sub?.close();
-    this.conns = [];
+  private isConnected(): boolean {
+    const all = (g: Gen | null) => g !== null && g.conns.length > 0 && g.conns.every((c) => c.open);
+    return all(this.cur) || all(this.old);
   }
 
-  private connect(): void {
-    this.closeConns();
-    const gen = ++this.gen;
-    this.armTick(gen);
-    const now = this.o.now();
-    this.connected = false;
-    this.msgSinceOpen = false;
-    this.reconnectPending = false;
-    this.connectStartedAt = now;
-    const streams = this.streamList();
-    const chunks: string[][] = [];
-    for (let i = 0; i < streams.length; i += STREAMS_PER_CONNECTION) chunks.push(streams.slice(i, i + STREAMS_PER_CONNECTION));
-    this.conns = chunks.map(() => ({ sub: null, open: false, lastMsg: now }));
-    for (const [i, chunk] of chunks.entries()) {
-      try {
-        const sub = this.o.client.stream(
-          chunk,
-          (m) => this.onMessage(gen, i, m),
-          (s) => this.onState(gen, i, s),
-        );
-        if (gen !== this.gen) sub.close();
-        else this.conns[i]!.sub = sub;
-      } catch (e) {
-        this.report(e);
-        this.scheduleReconnect();
-        return;
-      }
+  private closeGen(g: Gen | null): void {
+    if (!g) return;
+    for (const c of g.conns) {
+      c.epoch++;
+      c.sub?.close();
+      c.sub = null;
+      c.open = false;
     }
   }
 
-  private scheduleReconnect(): void {
-    if (this.reconnectPending || !this.running) return;
-    this.reconnectPending = true;
-    const delay = Math.min(RECONNECT_MIN_MS * 2 ** this.attempts, RECONNECT_MAX_MS);
-    this.attempts++;
-    const gen = this.gen;
-    this.o.setTimer(() => {
-      if (this.running && gen === this.gen) this.connect();
+  /** Open a new generation of connections. makeBeforeBreak keeps the current one until the new one is fully open. */
+  private connect(makeBeforeBreak: boolean): void {
+    this.closeGen(this.old);
+    this.old = null;
+    if (makeBeforeBreak && this.cur && this.cur.conns.some((c) => c.open)) this.old = this.cur;
+    else this.closeGen(this.cur);
+    const now = this.o.now();
+    const streams = this.streamList();
+    const conns: Conn[] = [];
+    for (let i = 0; i < streams.length; i += STREAMS_PER_CONNECTION) {
+      conns.push({ chunk: streams.slice(i, i + STREAMS_PER_CONNECTION), sub: null, open: false, epoch: 0, startedAt: now, lastMsg: now, attempts: 0, retryPending: false });
+    }
+    const g: Gen = { id: ++this.genSeq, conns, allOpenAt: 0 };
+    this.cur = g;
+    if (conns.length === 0) {
+      this.closeGen(this.old);
+      this.old = null;
+    }
+    for (let i = 0; i < conns.length; i++) this.openConn(g, i);
+  }
+
+  private openConn(g: Gen, i: number): void {
+    const c = g.conns[i]!;
+    c.sub?.close();
+    const epoch = ++c.epoch;
+    c.sub = null;
+    c.open = false;
+    c.retryPending = false;
+    c.startedAt = this.o.now();
+    try {
+      const sub = this.o.client.stream(
+        c.chunk,
+        (m) => this.onMessage(g, i, epoch, m),
+        (s) => this.onState(g, i, epoch, s),
+      );
+      if (epoch === c.epoch) c.sub = sub;
+      else sub.close();
+    } catch (e) {
+      this.report(e);
+      this.retryConn(g, i);
+    }
+  }
+
+  /** Reopen one connection after its own backoff. */
+  private retryConn(g: Gen, i: number): void {
+    const c = g.conns[i]!;
+    if (c.retryPending || g !== this.cur) return;
+    c.retryPending = true;
+    c.epoch++;
+    c.sub?.close();
+    c.sub = null;
+    c.open = false;
+    const delay = Math.min(RECONNECT_MIN_MS * 2 ** c.attempts, RECONNECT_MAX_MS);
+    c.attempts++;
+    this.timer(() => {
+      if (g === this.cur) this.openConn(g, i);
     }, delay);
   }
 
-  private onState(gen: number, i: number, s: 'open' | 'closed'): void {
-    const conn = this.conns[i];
-    if (gen !== this.gen || !this.running || !conn) return;
-    if (s === 'open') {
-      conn.open = true;
-      conn.lastMsg = this.o.now();
-      if (this.conns.every((c) => c.open)) {
-        this.connected = true;
-        this.openedAt = this.o.now();
-        this.requestCatchUp();
-      }
-    } else {
-      conn.open = false;
-      this.connected = false;
-      this.scheduleReconnect();
+  private conn(g: Gen, i: number, epoch: number): Conn | null {
+    if (!this.running || (g !== this.cur && g !== this.old)) return null;
+    const c = g.conns[i];
+    return c && c.epoch === epoch ? c : null;
+  }
+
+  private onState(g: Gen, i: number, epoch: number, s: 'open' | 'closed'): void {
+    const c = this.conn(g, i, epoch);
+    if (!c) return;
+    const now = this.o.now();
+    if (s === 'closed') {
+      c.open = false;
+      if (g === this.cur) this.retryConn(g, i);
+      return;
     }
+    c.open = true;
+    c.lastMsg = now;
+    if (g !== this.cur || !g.conns.every((x) => x.open)) return;
+    if (g.allOpenAt === 0) g.allOpenAt = now;
+    if (this.old) {
+      this.closeGen(this.old); // make-before-break: the new generation is up
+      this.old = null;
+    }
+    this.requestCatchUp();
+    // A close right at the switch may never arrive on either socket: look for it once REST has it.
+    const next = barOpenFor(now, this.o.tf) + this.step;
+    this.timer(() => this.requestCatchUp(), next + REST_SETTLE_MS - now);
   }
 
   // --- messages ----------------------------------------------------------------------------------------------
 
-  private onMessage(gen: number, i: number, m: unknown): void {
-    const conn = this.conns[i];
-    if (gen !== this.gen || !this.running || !conn) return;
+  private onMessage(g: Gen, i: number, epoch: number, m: unknown): void {
+    const c = this.conn(g, i, epoch);
+    if (!c) return;
     const now = this.o.now();
-    conn.lastMsg = now;
+    c.lastMsg = now;
+    c.attempts = 0;
     this.lastMessageAt = now;
-    this.msgSinceOpen = true;
-    this.attempts = 0;
     if (isRec(m) && typeof m.stream === 'string') {
       if (m.stream === '!ticker@arr') this.onTickers(m.data);
       else if (m.stream === '!markPrice@arr@1s') this.onMarks(m.data);
-      else if (m.stream.endsWith(`@kline_${this.o.tf}`)) this.onKlineEvent(m.data);
+      else if (m.stream.endsWith(`@kline_${this.o.tf}`)) {
+        this.lastKlineAt = now;
+        if (g === this.cur) this.lastCurKlineAt = now;
+        this.onKlineEvent(m.data);
+      }
     }
     this.maybeClearStale();
   }
@@ -306,9 +452,7 @@ export class LiveFeed {
     if (!p) {
       p = { bars: new Map(), queued: false };
       this.pending.set(closeTime, p);
-      this.o.setTimer(() => {
-        if (this.running) this.enqueue(closeTime);
-      }, CLOSE_WAIT_MS);
+      this.timer(() => this.enqueue(closeTime), CLOSE_WAIT_MS);
     }
     p.bars.set(k.s, c);
     if (!p.queued && p.bars.size >= this.symbols.size) {
@@ -319,17 +463,21 @@ export class LiveFeed {
 
   // --- watchdog ----------------------------------------------------------------------------------------------
 
-  private armTick(gen: number): void {
-    // One tick loop per generation; older loops stop themselves.
-    this.o.setTimer(() => {
-      if (!this.running || gen !== this.gen) return;
-      this.check();
-      this.armTick(gen);
-    }, TICK_MS);
-  }
-
   private overdue(): boolean {
     return this.symbols.size > 0 && this.o.now() >= this.lastEmitted + this.step + STALE_GRACE_MS;
+  }
+
+  private markStale(): void {
+    if (this.stale) return;
+    this.stale = true;
+    this.staleSince = this.o.now();
+  }
+
+  /** Reconnect the whole feed (make-before-break), at most once per SILENCE_MS. */
+  private staleReconnect(now: number): void {
+    if (now - this.lastStaleReconnectAt < SILENCE_MS) return;
+    this.lastStaleReconnectAt = now;
+    this.connect(true);
   }
 
   private check(): void {
@@ -339,24 +487,40 @@ export class LiveFeed {
       this.requestCatchUp();
     }
     if (this.overdue()) {
-      if (!this.pending.has(this.lastEmitted + this.step)) this.stale = true; // no closed kline arrived at all
+      if (!this.pending.has(this.lastEmitted + this.step)) this.markStale(); // no closed kline arrived at all
       this.requestCatchUp();
-      if (this.connected && now - this.lastStaleReconnectAt >= SILENCE_MS) {
-        this.lastStaleReconnectAt = now;
-        this.scheduleReconnect();
+      this.staleReconnect(now);
+    }
+    const g = this.cur;
+    if (g) {
+      for (const [i, c] of g.conns.entries()) {
+        if (c.open && now - c.lastMsg >= SILENCE_MS) {
+          this.markStale();
+          this.retryConn(g, i);
+        } else if (!c.open && !c.retryPending && now - c.startedAt >= OPEN_TIMEOUT_MS) {
+          this.retryConn(g, i);
+        }
       }
+      // Connections alive (e.g. tickers flowing) but no kline event at all: the kline streams are dead.
+      if (this.symbols.size > 0 && g.allOpenAt > 0 && now - Math.max(this.lastKlineAt, g.allOpenAt) >= SILENCE_MS) {
+        this.markStale();
+        this.staleReconnect(now);
+      }
+      if (g.allOpenAt > 0 && now - g.allOpenAt >= ROTATE_MS) this.connect(true);
     }
-    if (this.connected && this.conns.some((c) => now - c.lastMsg >= SILENCE_MS)) {
-      this.stale = true;
-      this.scheduleReconnect();
-    }
-    if (!this.connected && this.conns.length > 0 && now - this.connectStartedAt >= OPEN_TIMEOUT_MS) this.scheduleReconnect();
-    if (this.connected && now - this.openedAt >= ROTATE_MS) this.connect();
     this.maybeClearStale();
   }
 
   private maybeClearStale(): void {
-    if (this.stale && this.connected && this.msgSinceOpen && !this.inCatchUp && this.failedAt === null && !this.overdue()) {
+    if (
+      this.stale &&
+      this.cur !== null &&
+      this.cur.conns.every((c) => c.open) &&
+      this.lastCurKlineAt > this.staleSince &&
+      !this.inCatchUp &&
+      this.failedAt === null &&
+      !this.overdue()
+    ) {
       this.stale = false;
     }
   }
@@ -382,10 +546,72 @@ export class LiveFeed {
       });
   }
 
-  /** Write and fire every close in (lastEmitted, target], oldest first. Throws (writing nothing) if a backfill fails. */
+  /**
+   * One symbol's bars for openTimes [lo, hi]: stream bars first, then REST for the rest (retried while REST has no bar).
+   * `write` is what may be stored: contiguous from the newest stored bar, stopping at the first hole.
+   * Throws only on transient errors.
+   */
+  private async resolveSymbol(s: string, lo: number, hi: number): Promise<{ bars: Map<number, Candle>; write: Candle[] }> {
+    const { repo, tf, client } = this.o;
+    const step = this.step;
+    const latest = repo.latest(s, tf);
+    const bars = new Map<number, Candle>();
+    if (latest !== null && latest.openTime >= hi) {
+      for (const c of repo.range(s, tf, lo, hi)) bars.set(c.openTime, c);
+      return { bars, write: [] };
+    }
+    let from = lo;
+    let storable = true;
+    if (latest !== null && latest.openTime + step < lo) {
+      if (latest.openTime + step >= lo - GAP_FILL_BARS * step) from = latest.openTime + step; // small gap: fill it now
+      else {
+        storable = false; // too far behind: emit, but leave the repair to loadHistory
+        if (!this.reportedBehind.has(s)) {
+          this.reportedBehind.add(s);
+          this.report(new RepoBehindError(s, latest.openTime));
+        }
+      }
+    } else if (latest !== null) {
+      from = latest.openTime + step;
+    }
+    if (storable) this.reportedBehind.delete(s);
+
+    const holes = (): boolean => {
+      for (let t = from; t <= hi; t += step) if (!bars.has(t)) return true;
+      return false;
+    };
+    for (let t = from; t <= hi; t += step) {
+      const b = this.pending.get(t + step)?.bars.get(s);
+      if (b) bars.set(t, b);
+    }
+    for (let attempt = 0; holes() && attempt <= MISSING_RETRY_MS.length; attempt++) {
+      if (attempt > 0) await this.sleep(MISSING_RETRY_MS[attempt - 1]!);
+      if (!this.running) break;
+      this.inCatchUp = true;
+      let fetched: Candle[];
+      try {
+        fetched = await client.klines(s, tf, from, hi);
+      } catch (e) {
+        if (!isPermanent(e)) throw e;
+        this.report(e);
+        break; // this symbol is missing for this batch
+      }
+      for (const c of fetched) if (c.openTime >= from && c.openTime <= hi && !bars.has(c.openTime)) bars.set(c.openTime, c);
+    }
+    const write: Candle[] = [];
+    if (storable) {
+      for (let t = from; t <= hi; t += step) {
+        const b = bars.get(t);
+        if (!b) break;
+        write.push(b);
+      }
+    }
+    return { bars, write };
+  }
+
+  /** Write and fire every close in (lastEmitted, target], oldest first. Throws (writing nothing) on a transient failure. */
   private async emitThrough(target: number, catchUp: boolean): Promise<void> {
     if (!this.running || target <= this.lastEmitted) return;
-    const { tf, repo, client } = this.o;
     const step = this.step;
     const closes: number[] = [];
     for (let c = this.lastEmitted + step; c <= target; c += step) closes.push(c);
@@ -394,49 +620,34 @@ export class LiveFeed {
     if (catchUp || closes.length > 1) this.inCatchUp = true;
 
     const symbols = [...this.symbols];
-    const rows = new Map<string, Candle[]>();
-    const firstWanted = new Map<string, number>();
+    const resolved = new Map<string, Map<number, Candle>>();
+    const writes = new Map<string, Candle[]>();
     await forEachLimit(symbols, REST_CONCURRENCY, async (s) => {
-      const latest = repo.latest(s, tf);
-      // From the bar after the newest stored one, so the gap behind a stream bar is filled before (with) it.
-      const from = latest === null ? lo : latest.openTime + step;
-      firstWanted.set(s, from);
-      if (from > hi) return;
-      const merged = new Map<number, Candle>();
-      let covered = true;
-      for (let t = from; t <= hi; t += step) {
-        const b = this.pending.get(t + step)?.bars.get(s);
-        if (b) merged.set(t, b);
-        else covered = false;
-      }
-      if (!covered) {
-        this.inCatchUp = true;
-        for (const c of await client.klines(s, tf, from, hi)) {
-          if (c.openTime >= from && c.openTime <= hi && !merged.has(c.openTime)) merged.set(c.openTime, c);
-        }
-      }
-      rows.set(
-        s,
-        [...merged.values()].sort((a, b) => a.openTime - b.openTime),
-      );
+      const r = await this.resolveSymbol(s, lo, hi);
+      resolved.set(s, r.bars);
+      if (r.write.length > 0) writes.set(s, r.write);
     });
     if (!this.running) return;
-    repo.upsertMany(tf, rows);
+    this.o.repo.upsertMany(this.o.tf, writes);
+    this.failedAt = null;
 
     for (const closeTime of closes) {
       if (!this.running) return;
       const open = closeTime - step;
       const bars = new Map<string, Candle>();
+      const missing: string[] = [];
       for (const s of symbols) {
-        let b = rows.get(s)?.find((c) => c.openTime === open);
-        if (!b && open < firstWanted.get(s)!) b = repo.range(s, tf, open, open)[0];
+        const b = resolved.get(s)?.get(open);
         if (b) bars.set(s, b);
+        else missing.push(s);
       }
       this.lastEmitted = closeTime;
+      this.lastMissing = missing;
       for (const k of [...this.pending.keys()]) if (k <= closeTime) this.pending.delete(k);
+      if (missing.length > 0) this.report(new MissingBarsError(closeTime, missing));
       for (const cb of [...this.closeListeners]) {
         try {
-          await cb(closeTime, bars);
+          await cb(closeTime, bars, [...missing]);
         } catch (e) {
           this.report(e);
         }

@@ -55,6 +55,8 @@ export class FakeExchange implements ExchangeClient {
   private readonly candles = new Map<string, Candle[]>();
   private readonly funding = new Map<string, FundingEvent[]>();
   private readonly scripted: ScriptedResponse[] = [];
+  private readonly klineScripts = new Map<string, (number | 'empty')[]>();
+  private readonly klineFailures = new Map<string, number>();
   private readonly deps: PageDeps;
 
   constructor(private readonly o: FakeExchangeOptions) {
@@ -80,13 +82,32 @@ export class FakeExchange implements ExchangeClient {
     this.scripted.push(...responses);
   }
 
+  /** Queue per-symbol kline replies: a status code, or 'empty' for a 200 with no bars. Consumed before `script`. */
+  scriptKlines(symbol: string, ...replies: (number | 'empty')[]): void {
+    this.klineScripts.set(symbol, [...(this.klineScripts.get(symbol) ?? []), ...replies]);
+  }
+
+  /** Every kline request for `symbol` returns `status` until called again with null. */
+  failKlines(symbol: string, status: number | null): void {
+    if (status === null) this.klineFailures.delete(symbol);
+    else this.klineFailures.set(symbol, status);
+  }
+
   private getJson(url: string, weight: number): Promise<unknown> {
     return budgetedGet(this.budget, weight, () => {
-      const s = this.scripted.shift();
+      const u = new URL(url);
+      const sym = u.pathname === '/fapi/v1/klines' ? (u.searchParams.get('symbol') ?? '') : '';
+      const perSymbol = this.klineFailures.get(sym) ?? this.klineScripts.get(sym)?.shift();
+      const s = perSymbol === undefined ? this.scripted.shift() : undefined;
       const headers = new Headers();
       let status = 200;
       let body: unknown = null;
-      if (s) {
+      if (perSymbol === 'empty') {
+        body = [];
+      } else if (perSymbol !== undefined) {
+        status = perSymbol;
+        body = { msg: 'scripted' };
+      } else if (s) {
         status = s.status;
         if (s.retryAfter !== undefined) headers.set('retry-after', String(s.retryAfter));
         if (s.usedWeight !== undefined) headers.set('x-mbx-used-weight-1m', String(s.usedWeight));
@@ -188,6 +209,24 @@ export class FakeExchange implements ExchangeClient {
       '!markPrice@arr@1s',
       rows.map((m) => ({ e: 'markPriceUpdate', E: m.time, s: m.symbol, p: String(m.markPrice), r: String(m.fundingRate), T: m.nextFundingTime })),
     );
+  }
+
+  /** Open connections created while `autoOpenStreams` was false. */
+  openPending(): void {
+    for (const c of this.connections) {
+      if (c.closed || c.open) continue;
+      c.open = true;
+      c.onState('open');
+    }
+  }
+
+  /** The server drops one live connection (index among the not-yet-closed ones). */
+  dropConnection(liveIndex: number): void {
+    const c = this.connections.filter((x) => !x.closed)[liveIndex];
+    if (!c) throw new Error(`no live connection ${liveIndex}`);
+    c.closed = true;
+    c.open = false;
+    c.onState('closed');
   }
 
   /** The server drops every open or pending connection: each reports 'closed'. */

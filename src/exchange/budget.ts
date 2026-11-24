@@ -83,6 +83,17 @@ export class RestBudget {
   }
 }
 
+/** A non-2xx reply (after retries for 429/418). `status` lets callers tell a bad request from a transient failure. */
+export class HttpStatusError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'HttpStatusError';
+  }
+}
+
 export interface RestResponse {
   status: number;
   headers: { get(name: string): string | null };
@@ -104,10 +115,10 @@ export async function budgetedGet(budget: RestBudget, weight: number, doGet: () 
     if (res.status === 429 || res.status === 418) {
       if (res.status === 429) budget.backoff(retryAfterMs(res));
       else budget.ban(retryAfterMs(res));
-      if (attempt >= MAX_ATTEMPTS) throw new Error(`HTTP ${res.status}: gave up after ${attempt} attempts`);
+      if (attempt >= MAX_ATTEMPTS) throw new HttpStatusError(res.status, `HTTP ${res.status}: gave up after ${attempt} attempts`);
       continue;
     }
-    if (res.status < 200 || res.status >= 300) throw new Error(`HTTP ${res.status}`);
+    if (res.status < 200 || res.status >= 300) throw new HttpStatusError(res.status, `HTTP ${res.status}`);
     if (res.body === null) throw new Error('response body was not JSON');
     return res.body;
   }

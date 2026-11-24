@@ -30,15 +30,21 @@ export const flush = (): Promise<void> => new Promise((resolve) => setImmediate(
  */
 export function makeTimers(clock: ReturnType<typeof makeClock>): {
   setTimer: typeof setTimeout;
+  clearTimer: typeof clearTimeout;
   advance: (ms: number) => Promise<void>;
   pending: () => number;
 } {
   let seq = 0;
-  const queue: { at: number; seq: number; fn: () => void }[] = [];
+  const queue: { at: number; seq: number; fn: () => void; handle: object }[] = [];
   const setTimer = ((fn: () => void, ms?: number) => {
-    queue.push({ at: clock.now() + (ms ?? 0), seq: seq++, fn });
-    return { ref: () => undefined, unref: () => undefined } as unknown as NodeJS.Timeout;
+    const handle = { ref: () => handle, unref: () => handle };
+    queue.push({ at: clock.now() + (ms ?? 0), seq: seq++, fn, handle });
+    return handle as unknown as NodeJS.Timeout;
   }) as unknown as typeof setTimeout;
+  const clearTimer = ((handle: unknown) => {
+    const i = queue.findIndex((q) => q.handle === handle);
+    if (i >= 0) queue.splice(i, 1);
+  }) as unknown as typeof clearTimeout;
   const advance = async (ms: number): Promise<void> => {
     const end = clock.now() + ms;
     await flush();
@@ -54,5 +60,5 @@ export function makeTimers(clock: ReturnType<typeof makeClock>): {
     clock.set(end);
     await flush();
   };
-  return { setTimer, advance, pending: () => queue.length };
+  return { setTimer, clearTimer, advance, pending: () => queue.length };
 }
