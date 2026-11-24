@@ -22,9 +22,20 @@
 //
 // Cancellations (strategy.cancel / cancel_all, replaced or withdrawn exits) are applied to the broker
 // directly; everything to submit is returned.
+//
+// An exit leg the broker did not take (rejected at submit) is sent again on the next settle, at most
+// MAX_RESENDS_PER_BAR times per bar and MAX_RESENDS times in all; after that it is abandoned (one
+// exit_leg_abandoned anomaly) and never sent again for that exit.
+//
+// A delisting (broker.forceClose) closes the whole position: its fill clears the open trades, the held
+// exits and the parked entries, and nothing is sent for them.
+//
+// Live runs save the layer with the broker (snapshot / restore, src/engine/layer-state.ts). Sizing is the
+// broker's current rule (PaperBroker.setSizing), so an owner edit reaches both.
 import type { PaperBroker } from '../broker/broker.js';
 import { leverageInForce } from '../broker/margin.js';
 import type { Candle, Fill, OrderIntent, PairRules, SizingRule } from '../core/types.js';
+import { decodeLayer, encodeLayer, type Dir, type ExitReg, type LayerState, type Lot, type OrderMeta, type TradeRecord } from './layer-state.js';
 import type { PineOrderCall, StrategyDeclaration } from './pine-runner.js';
 
 export interface ScriptTrade {
@@ -56,22 +67,6 @@ export interface LayerOptions {
   from?: number;
 }
 
-type Dir = 1 | -1;
-
-/** A physical lot: what a close or exit for its entry id may still take. */
-interface Lot {
-  entryId: string;
-  qty: number;
-  dir: Dir;
-  price: number;
-  /** Exit ids that have filled against this trade: an exit id fills once per trade (TradingView). */
-  exitsFilled: Set<string>;
-  /** Filled past the pyramiding cap (see book): not a script trade, closed at the next open. */
-  overfill?: boolean;
-  /** Overfill lots: when the lot filled (its round trip's entry time). */
-  time?: number;
-}
-
 interface OverfillPiece {
   qty: number;
   price: number;
@@ -80,7 +75,7 @@ interface OverfillPiece {
 
 /** Something the layer had to correct after the broker acted; the replay should log these. */
 export interface LayerAnomaly {
-  kind: 'pyramiding_overfill' | 'exit_leg_resent' | 'overfill_absorbed';
+  kind: 'pyramiding_overfill' | 'exit_leg_resent' | 'exit_leg_abandoned' | 'overfill_absorbed';
   orderId: string;
   time: number;
 }
@@ -104,42 +99,10 @@ export interface TradeAttribution {
 
 const OVERFILL = '\u0000overfill';
 
-/** An open trade as the script sees it (strategy.opentrades): exits pair with these by close_entries_rule. */
-interface TradeRecord {
-  entryId: string;
-  qty: number;
-  dir: Dir;
-  price: number;
-  barIndex: number;
-  time: number;
-}
-
-interface OrderMeta {
-  kind: 'entry' | 'order' | 'exit' | 'close' | 'close_all' | 'overfill';
-  entryId?: string;
-  /** exit legs: the exit registration they belong to. */
-  exitKey?: string;
-}
-
-interface ExitReg {
-  key: string;
-  exitId: string;
-  /** '' = every open entry. */
-  fromEntry: string;
-  qty?: number;
-  qtyPercent?: number;
-  limit?: number;
-  stop?: number;
-  profitTicks?: number;
-  lossTicks?: number;
-  ocaName?: string;
-  /** Leg order id -> the intent last handed out for it (JSON), to send only changes. */
-  sent: Map<string, string>;
-  /** It has had a trade to protect (so it dies when that trade is gone). */
-  wasLive: boolean;
-}
-
 const EPS = 1e-9;
+/** Re-sends of one rejected exit leg: per bar, and in all (then it is abandoned). */
+export const MAX_RESENDS_PER_BAR = 3;
+export const MAX_RESENDS = 10;
 
 function decimalsOf(step: number): number {
   const s = String(step);
@@ -155,12 +118,12 @@ export class StrategyLayer {
   private readonly from?: number;
   private lots: Lot[] = [];
   private records: TradeRecord[] = [];
-  private readonly meta = new Map<string, OrderMeta>();
-  private readonly exits = new Map<string, ExitReg>();
+  private meta = new Map<string, OrderMeta>();
+  private exits = new Map<string, ExitReg>();
   /** strategy.entry adds taken off the broker while the pyramiding cap is full (they go back once there is room). */
-  private readonly parked = new Map<string, OrderIntent>();
-  private readonly anomalyLog: LayerAnomaly[] = [];
-  private readonly attributionLog: TradeAttribution[] = [];
+  private parked = new Map<string, OrderIntent>();
+  private anomalyLog: LayerAnomaly[] = [];
+  private attributionLog: TradeAttribution[] = [];
   /** The broker's averaged entry over the script's own fills (overfill lots left out). */
   private scriptAvg = 0;
   /** An overfill lot has been part of the current broker position. */
@@ -171,11 +134,49 @@ export class StrategyLayer {
     private readonly decl: StrategyDeclaration,
     private readonly broker: PaperBroker,
     private readonly symbol: string,
-    private readonly sizing: SizingRule,
+    sizing: SizingRule,
     opts: LayerOptions,
   ) {
+    // The layer sizes with the broker's rule as it is at each order (setSizing reaches both): a different
+    // rule here would be silently ignored, so it is a wiring error.
+    if (JSON.stringify(sizing) !== JSON.stringify(broker.sizingRule())) {
+      throw new Error(`StrategyLayer(${symbol}): sizing ${JSON.stringify(sizing)} is not the broker's ${JSON.stringify(broker.sizingRule())}`);
+    }
     this.rules = opts.rules;
     this.from = opts.from;
+  }
+
+  /** Plain JSON, saved with the broker's snapshot: restore() continues exactly where this left off. */
+  snapshot(): LayerState {
+    return encodeLayer(this.symbol, {
+      lots: this.lots,
+      records: this.records,
+      meta: this.meta,
+      exits: this.exits,
+      parked: this.parked,
+      scriptAvg: this.scriptAvg,
+      tainted: this.tainted,
+      seq: this.seq,
+      anomalies: this.anomalyLog,
+      attributions: this.attributionLog,
+    });
+  }
+
+  /** The layer `s` was taken from, on the restored broker. The other arguments are the constructor's, as at construction. */
+  static restore(s: LayerState, decl: StrategyDeclaration, broker: PaperBroker, symbol: string, sizing: SizingRule, opts: LayerOptions): StrategyLayer {
+    const layer = new StrategyLayer(decl, broker, symbol, sizing, opts);
+    const d = decodeLayer(symbol, s);
+    layer.lots = d.lots;
+    layer.records = d.records;
+    layer.meta = d.meta;
+    layer.exits = d.exits;
+    layer.parked = d.parked;
+    layer.scriptAvg = d.scriptAvg;
+    layer.tainted = d.tainted;
+    layer.seq = d.seq;
+    layer.anomalyLog = d.anomalies;
+    layer.attributionLog = d.attributions;
+    return layer;
   }
 
   /** Corrections the layer made after the broker acted (pyramiding overfills, re-sent exit legs). */
@@ -238,7 +239,15 @@ export class StrategyLayer {
     for (const f of fills) {
       if (f.symbol !== this.symbol) continue;
       if (f.orderId.startsWith('liquidation:')) {
-        this.attributeLiquidation(f);
+        this.attributeFullClose(f);
+        continue;
+      }
+      if (f.orderId.startsWith('delisting:')) {
+        // The pair is leaving: the whole position closed, and nothing of the script's may follow it.
+        this.attributeFullClose(f);
+        for (const reg of [...this.exits.values()]) this.dropExit(reg);
+        this.parked.clear();
+        this.meta.clear();
         continue;
       }
       const m = this.meta.get(f.orderId);
@@ -297,8 +306,8 @@ export class StrategyLayer {
       throw new Error(`StrategyLayer(${this.symbol}) is out of sync with the broker (${net} vs ${qty}): every broker fill must reach onFills`);
     }
     const last = this.broker.lastPriceOf(this.symbol);
-    let netProfit = 0;
-    for (const t of this.broker.closedTrades()) if (t.symbol === this.symbol) netProfit += t.pnl - t.fees + t.funding;
+    // Kept running per symbol by the broker: one shared broker holds every pair's closed trades.
+    const netProfit = this.broker.realisedNet(this.symbol);
     return {
       positionSize: qty,
       positionAvgPrice: pos ? pos.entryPrice : NaN,
@@ -380,6 +389,9 @@ export class StrategyLayer {
       ocaName: c.ocaName,
       sent: old?.sent ?? new Map(),
       wasLive: old?.wasLive ?? false,
+      awaiting: old?.awaiting ?? new Set(),
+      retries: old?.retries ?? new Map(),
+      abandoned: old?.abandoned ?? new Set(),
     });
   }
 
@@ -454,7 +466,7 @@ export class StrategyLayer {
       [`${base}|stop`, sl === undefined || !(qty > 0) ? null : this.exitLeg(`${base}|stop`, 'stop', this.roundLevel(sl, -dir as Dir, 'stop'), dir, qty, reg, oca)],
     ];
     // A leg handed out earlier that the broker does not hold: in a user OCA group a sibling's fill took
-    // it (the exit is used up); otherwise the broker rejected it at submit, so it is sent again.
+    // it (the exit is used up); otherwise the broker rejected it at submit, so it is sent again (bounded).
     for (const [id] of legs) {
       if (!reg.sent.has(id) || resting.has(id) || batch.has(id)) continue;
       if (reg.ocaName) {
@@ -463,23 +475,54 @@ export class StrategyLayer {
         return;
       }
       reg.sent.delete(id);
-      this.anomalyLog.push({ kind: 'exit_leg_resent', orderId: id, time });
+      reg.awaiting.add(id);
     }
     for (const [id, intent] of legs) {
       if (intent) {
+        if (reg.abandoned.has(id)) continue;
         const json = JSON.stringify(intent);
         if (reg.sent.get(id) !== json) {
+          if (reg.awaiting.has(id) && !this.mayResend(reg, id, time)) continue;
           reg.sent.set(id, json);
           this.meta.set(id, { kind: 'exit', entryId: reg.fromEntry || undefined, exitKey: reg.key });
           batch.set(id, intent);
         }
-      } else if (reg.sent.has(id)) {
-        reg.sent.delete(id);
-        batch.delete(id);
-        this.broker.cancel(id);
-        this.meta.delete(id);
+      } else {
+        reg.awaiting.delete(id);
+        if (reg.sent.has(id)) {
+          reg.sent.delete(id);
+          batch.delete(id);
+          this.broker.cancel(id);
+          this.meta.delete(id);
+        }
       }
     }
+  }
+
+  /**
+   * A rejected leg is due again: counts the re-send (logged), or holds it to the next bar once this bar
+   * has had MAX_RESENDS_PER_BAR, or abandons it for good (logged once) after MAX_RESENDS.
+   */
+  private mayResend(reg: ExitReg, id: string, time: number): boolean {
+    let r = reg.retries.get(id);
+    if (!r) reg.retries.set(id, (r = { total: 0, bar: time, inBar: 0 }));
+    if (r.bar !== time) {
+      r.bar = time;
+      r.inBar = 0;
+    }
+    if (r.total >= MAX_RESENDS) {
+      reg.awaiting.delete(id);
+      reg.abandoned.add(id);
+      this.meta.delete(id);
+      this.anomalyLog.push({ kind: 'exit_leg_abandoned', orderId: id, time });
+      return false;
+    }
+    if (r.inBar >= MAX_RESENDS_PER_BAR) return false;
+    r.total++;
+    r.inBar++;
+    reg.awaiting.delete(id);
+    this.anomalyLog.push({ kind: 'exit_leg_resent', orderId: id, time });
+    return true;
   }
 
   private exitLeg(
@@ -595,8 +638,8 @@ export class StrategyLayer {
     return pieces.map((p): AttributionPart => ({ kind: 'overfill', qty: p.qty, entryPrice: p.price, entryTime: p.time, pnl: posDir * (exit - p.price) * p.qty }));
   }
 
-  /** A liquidation took the whole position: while tainted, it is restated like any other closing fill. */
-  private attributeLiquidation(f: Fill): void {
+  /** A liquidation or delisting took the whole position: while tainted, it is restated like any other closing fill. */
+  private attributeFullClose(f: Fill): void {
     const net = this.netSize();
     if (this.tainted && Math.abs(net) > EPS) {
       const posDir: Dir = net > 0 ? 1 : -1;
@@ -768,7 +811,8 @@ export class StrategyLayer {
     // A stop / limit not yet marketable at the close is sized at its own level.
     if (stop !== undefined) price = (dir > 0 ? close >= stop : close <= stop) ? close : stop;
     else if (limit !== undefined) price = (dir > 0 ? close <= limit : close >= limit) ? close : limit;
-    if (this.sizing.kind === 'fixed') return this.roundQty(this.sizing.notionalUsd / price);
+    const sizing = this.broker.sizingRule();
+    if (sizing.kind === 'fixed') return this.roundQty(sizing.notionalUsd / price);
     if (qtyArg !== undefined) return this.roundQty(Math.abs(qtyArg));
     const value = this.decl.defaultQtyValue;
     if (type === 'market' || type === 'stop') price += dir * (this.decl.overridden.slippage ?? 0) * this.rules.tickSize;

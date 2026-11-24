@@ -43,6 +43,45 @@ describe('request.security on another symbol', () => {
   it.each(['syminfo.tickerid', '"BTCUSDT"', '"BINANCE:BTCUSDT"', '"BINANCE:BTCUSDT.P"'])('accepts the chart symbol as %s', async (id) => {
     expect(await compileScript(script(`request.security(${id}, "D", close)`))).toMatchObject({ ok: true });
   });
+
+  it('own-symbol string compiles on its own chart', async () => {
+    const src = script('request.security("ETHUSDT", "D", close)');
+    expect(await compileScript(src, '4h', 'ETHUSDT')).toMatchObject({ ok: true });
+    expect(await compileScript(script('request.security("BINANCE:ETHUSDT.P", "D", close)'), '4h', 'ETHUSDT')).toMatchObject({ ok: true });
+    // BTCUSDT is now the other symbol, and its call line is reported.
+    const other = '//@version=6\nstrategy("s")\na = request.security("ETHUSDT", "D", close)\nb = request.security("BTCUSDT", "D", close)\nplot(a + b)\n';
+    expect(await compileScript(other, '4h', 'ETHUSDT')).toEqual({ ok: false, errors: [{ line: 4, message: MSG }] });
+  });
+});
+
+describe('compileScript lists security timeframes', () => {
+  const LITERAL = (n: number) => `request.security timeframe on line ${n} must be a literal in v1`;
+
+  it('KyberSwing (an input.timeframe default) gives D', async () => {
+    expect(await compileScript(KYBER)).toMatchObject({ ok: true, securityTimeframes: ['D'] });
+  });
+
+  it('gives the timeframes as written, deduplicated, in order of first use', async () => {
+    const src =
+      '//@version=6\nstrategy("s")\ntf = "W"\nstring tf2 = input.timeframe(defval = "720", title = "t")\n' +
+      'a = request.security(syminfo.tickerid, "D", close)\nb = request.security(syminfo.tickerid, tf, close)\n' +
+      'c = request.security(syminfo.tickerid, timeframe = "D", expression = close)\nd = request.security(syminfo.tickerid, tf2, close)\n' +
+      'plot(a + b + c + d)\n';
+    expect(await compileScript(src)).toMatchObject({ ok: true, securityTimeframes: ['D', 'W', '720'] });
+  });
+
+  it('is empty without request.security', async () => {
+    expect(await compileScript('//@version=6\nstrategy("b")\nplot(close)\n')).toMatchObject({ ok: true, securityTimeframes: [] });
+  });
+
+  it('a timeframe that is not a literal is a compile error on its call line', async () => {
+    const dyn = '//@version=6\nstrategy("s")\ntf = close > open ? "D" : "W"\nx = request.security(syminfo.tickerid, tf, close)\nplot(x)\n';
+    expect(await compileScript(dyn)).toEqual({ ok: false, errors: [{ line: 4, message: LITERAL(4) }] });
+    const reassigned = '//@version=6\nstrategy("s")\nvar tf = "D"\nif close > open\n    tf := "W"\nx = request.security(syminfo.tickerid, tf, close)\nplot(x)\n';
+    expect(await compileScript(reassigned)).toEqual({ ok: false, errors: [{ line: 6, message: LITERAL(6) }] });
+    const expr = '//@version=6\nstrategy("s")\nx = request.security(syminfo.tickerid, str.tostring(1) + "D", close)\nplot(x)\n';
+    expect(await compileScript(expr)).toEqual({ ok: false, errors: [{ line: 3, message: LITERAL(3) }] });
+  });
 });
 
 describe('compileScript on the chart timeframe', () => {

@@ -120,6 +120,8 @@ export interface StoredOrder extends OrderIntent {
   submittedAt: number;
   /** stop_limit only: the stop has triggered and it now rests as a limit. */
   triggered?: boolean;
+  /** The taker rate in force at submit: its margin reservation keeps it after a fee edit. Absent in older states. */
+  reserveRate?: number;
 }
 
 /** Fees and funding accrued on the currently open position, split into closed trades pro rata. */
@@ -140,6 +142,11 @@ export interface BrokerState {
   orders: StoredOrder[];
   closed: ClosedTrade[];
   rejections: Rejection[];
+  /** Per symbol: the running pnl - fees + funding of its closed trades. Absent in older states (rebuilt from `closed`). */
+  realisedNet?: Record<string, number>;
+  /** The fees and sizing in force (owner edits after approval). Absent in older states (the options' are used). */
+  fees?: FeeConfig;
+  sizing?: SizingRule;
 }
 
 /** An accepted order that was dropped at fill time because it no longer fit the free margin. */

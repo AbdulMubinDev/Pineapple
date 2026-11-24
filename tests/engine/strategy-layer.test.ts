@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { PaperBroker } from '../../src/broker/broker.js';
 import type { BrokerMode, Candle, OrderIntent, PairRules, SizingRule } from '../../src/core/types.js';
 import type { PineOrderCall, StrategyDeclaration } from '../../src/engine/pine-runner.js';
@@ -464,6 +464,101 @@ describe('StrategyLayer', () => {
     r.before(flatBar(2));
     expect(r.broker.openOrders(SYM)).toEqual([expect.objectContaining({ type: 'stop', stopPrice: 48_000 })]);
     expect(r.layer.anomalies()).toEqual([{ kind: 'exit_leg_resent', orderId: 'BTCUSDT|X|X|L|stop', time: T0 + 2 * H4 }]);
+  });
+
+  it('rejected exit leg is abandoned after 10 resends', () => {
+    const r = rig();
+    r.after(flatBar(0), [entry('L', 'long', { qty: 1 })]);
+    r.before(flatBar(1));
+    r.ctl.reject = (i) => i.tag === 'exit';
+    const exitCall = exit('X', { fromEntry: 'L', stop: 48_000 });
+    r.after(flatBar(1), [exitCall]);
+    for (let i = 2; i < 12; i++) {
+      const b = flatBar(i);
+      r.before(b);
+      // More settles in one bar than the per-bar cap (a live bar can have many broker events).
+      for (let k = 0; k < 4; k++) for (const x of r.layer.onFills([], b, i)) r.rejected.push(x);
+      r.after(b, [exitCall]);
+    }
+    const leg = 'BTCUSDT|X|X|L|stop';
+    const t = (i: number) => T0 + i * H4;
+    expect(r.layer.anomalies()).toEqual([
+      ...[2, 2, 2, 3, 3, 3, 4, 4, 4, 5].map((i) => ({ kind: 'exit_leg_resent', orderId: leg, time: t(i) })),
+      { kind: 'exit_leg_abandoned', orderId: leg, time: t(5) },
+    ]);
+    // 1 first send + 10 re-sends, then nothing more: no unbounded growth.
+    expect(r.rejected.filter((i) => i.id === leg)).toHaveLength(11);
+    expect(r.broker.position(SYM)).toMatchObject({ qty: 1 });
+    // Its trade's other business goes on: a close still closes it, and a new trade's exit is fresh.
+    r.ctl.reject = undefined;
+    r.after(flatBar(12), [{ kind: 'close', id: 'L' }]);
+    r.before(flatBar(13));
+    r.after(flatBar(13), [entry('L', 'long', { qty: 1 }), exitCall]);
+    r.before(flatBar(14));
+    expect(r.broker.openOrders(SYM)).toEqual([expect.objectContaining({ id: leg, stopPrice: 48_000 })]);
+  });
+
+  it('sizes with the broker\'s current rule after setSizing, and a mismatched rule is a wiring error', () => {
+    const r = rig({ sizing: { kind: 'fixed', notionalUsd: 100_000 } });
+    expect(r.after(flatBar(0), [entry('L', 'long', { qty: 0.5 })])[0]!.qty).toBe(2);
+    r.before(flatBar(1));
+    r.after(flatBar(1), [{ kind: 'close', id: 'L' }]);
+    r.before(flatBar(2));
+    r.broker.setSizing({ kind: 'script' });
+    r.after(flatBar(2), [entry('L', 'long', { qty: 0.5 })]);
+    expect(r.before(flatBar(3)).positionSize).toBe(0.5);
+    expect(() => new StrategyLayer(decl(), r.broker, SYM, { kind: 'fixed', notionalUsd: 1 }, { rules })).toThrow(/not the broker's/);
+  });
+
+  it('scriptView cost does not grow with closed trades', () => {
+    const r = rig({ balance: 1e9 });
+    // 5,000 closed trades on other symbols, straight on the shared broker.
+    r.broker.markToMarket('ETHUSDT', 2_000);
+    for (let i = 0; i < 5_000; i++) {
+      const t = T0 + i;
+      r.broker.submit({ id: `e${i}`, symbol: 'ETHUSDT', side: 'buy', type: 'market', qty: 1, reduceOnly: false, tag: 'entry', leverage: 10 }, t);
+      r.broker.onBarOpen('ETHUSDT', { openTime: t, open: 2_000, high: 2_000, low: 2_000, close: 2_000, volume: 1 });
+      r.broker.submit({ id: `x${i}`, symbol: 'ETHUSDT', side: 'sell', type: 'market', qty: 1, reduceOnly: true, tag: 'exit', leverage: 10 }, t);
+      r.broker.onBarOpen('ETHUSDT', { openTime: t, open: 2_001 + (i % 3), high: 2_003, low: 2_001, close: 2_001, volume: 1 });
+    }
+    // Two trades of its own.
+    r.after(flatBar(0, 50_000), [entry('L', 'long', { qty: 1 })]);
+    r.before(flatBar(1, 50_000));
+    r.after(flatBar(1, 50_000), [{ kind: 'close', id: 'L' }]);
+    r.before(flatBar(2, 50_700));
+    r.after(flatBar(2, 50_700), [entry('S', 'short', { qty: 2 })]);
+    r.before(flatBar(3, 50_000));
+    r.after(flatBar(3, 50_000), [{ kind: 'close', id: 'S' }]);
+    const spy = vi.spyOn(r.broker, 'closedTrades');
+    const views = [4, 5, 6].map((i) => r.before(flatBar(i, 49_000)));
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+    let want = 0;
+    for (const t of r.broker.closedTrades()) if (t.symbol === SYM) want += t.pnl - t.fees + t.funding;
+    expect(want).toBe(700 + 2 * (50_000 - 49_000));
+    for (const v of views) expect(v.netProfit).toBe(want);
+    expect(r.broker.closedTrades()).toHaveLength(5_002);
+  });
+
+  it('a delisting close leaves the layer flat with no held exits and nothing to send', () => {
+    const r = rig({ d: { pyramiding: 1 } });
+    // B rests as a limit add and is parked once A fills (cap 1); both have exits, B's held for its entry.
+    r.after(flatBar(0), [
+      entry('B', 'long', { qty: 1, limit: 40_000 }),
+      entry('A', 'long', { qty: 1 }),
+      exit('XA', { fromEntry: 'A', stop: 45_000 }),
+      exit('XB', { fromEntry: 'B', stop: 30_000 }),
+    ]);
+    r.before(flatBar(1));
+    expect(r.broker.openOrders(SYM).map((o) => o.id)).toEqual(['BTCUSDT|X|XA|A|stop']);
+    const fills = r.broker.forceClose(SYM, 49_000, T0 + H4 + 1, 'delisting');
+    expect(r.layer.onFills(fills, flatBar(1), 1)).toEqual([]);
+    expect(r.layer.scriptView()).toMatchObject({ positionSize: 0, openTrades: 0, opentrades: [] });
+    expect(r.layer.snapshot()).toMatchObject({ lots: [], records: [], exits: [], parked: [] });
+    expect(r.broker.openOrders()).toEqual([]);
+    expect(r.broker.closedTrades().at(-1)).toMatchObject({ exitReason: 'delisting', exitPrice: 49_000, qty: 1 });
+    // Nothing comes back on later settles either.
+    expect(r.layer.onFills([], flatBar(2), 2)).toEqual([]);
   });
 
   it('a held exit is dropped when its pending entry is rejected at the broker', () => {

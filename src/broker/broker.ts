@@ -45,6 +45,9 @@ const clone = <T>(x: T): T => JSON.parse(JSON.stringify(x)) as T;
  */
 export class PaperBroker {
   private readonly o: BrokerOptions;
+  /** In force now: the options' until setFees / setSizing (owner edits after approval) replace them. */
+  private fees: FeeConfig;
+  private sizing: SizingRule;
   private balance: number;
   private feesPaid = 0;
   private fundingNet = 0;
@@ -54,11 +57,70 @@ export class PaperBroker {
   private lastPrice: Record<string, number> = {};
   private orders: StoredOrder[] = [];
   private closed: ClosedTrade[] = [];
+  /** Per symbol: the running sum of its closed trades' pnl - fees + funding (in closing order). */
+  private realised: Record<string, number> = {};
   private rejected: Rejection[] = [];
 
   constructor(o: BrokerOptions) {
     this.o = o;
+    this.fees = { ...o.fees };
+    this.sizing = { ...o.sizing };
     this.balance = o.startingBalance;
+  }
+
+  /**
+   * Replaces the fees and slippage from the next submit or fill on. Fills already made keep theirs, and
+   * a pending opening order keeps the margin reservation it was accepted with.
+   */
+  setFees(f: FeeConfig): void {
+    this.fees = { ...f };
+  }
+
+  /** Replaces the sizing rule from the next submit on (orders already queued keep their qty). */
+  setSizing(s: SizingRule): void {
+    this.sizing = { ...s };
+  }
+
+  feeConfig(): FeeConfig {
+    return { ...this.fees };
+  }
+
+  sizingRule(): SizingRule {
+    return { ...this.sizing };
+  }
+
+  /** The realised net (pnl - fees + funding) of `symbol`'s closed trades, kept as they close: O(1). */
+  realisedNet(symbol: string): number {
+    return this.realised[symbol] ?? 0;
+  }
+
+  /**
+   * Closes `symbol`'s whole position at `price` (no slippage, the taker fee) and cancels all of its
+   * orders: the pair is leaving the exchange. Returns the closing fill (none when flat); the caller
+   * passes it to the strategy layer's onFills like any other fill.
+   */
+  forceClose(symbol: string, price: number, time: number, reason: 'delisting'): Fill[] {
+    this.orders = this.orders.filter((x) => x.symbol !== symbol);
+    this.lastPrice[symbol] = price;
+    const pos = this.positions[symbol];
+    if (!pos) return [];
+    const qty = Math.abs(pos.qty);
+    const side = pos.qty > 0 ? 'sell' : 'buy';
+    const ord: StoredOrder = {
+      id: `${reason}:${symbol}:${time}`,
+      symbol,
+      side,
+      type: 'market',
+      qty,
+      reduceOnly: true,
+      tag: 'exit',
+      leverage: pos.leverage,
+      seq: -1,
+      submittedAt: time,
+    };
+    const fee = tradeFee(qty, price, this.fees.takerRate);
+    this.applyFill(ord, qty, price, fee, time, reason);
+    return [{ orderId: ord.id, symbol, time, price, qty, side, fee, liquidity: 'taker' }];
   }
 
   /** Queue an order. Market orders fill at the next onBarOpen/onPrice. */
@@ -71,10 +133,10 @@ export class PaperBroker {
     const reduce = this.isReduce(i);
     const pos = this.positions[i.symbol];
     let qty = i.qty;
-    if (this.o.sizing.kind === 'fixed' && i.tag === 'entry' && !i.reduceOnly) {
+    if (this.sizing.kind === 'fixed' && i.tag === 'entry' && !i.reduceOnly) {
       // Fixed sizing sizes only the opening part; an opposing order also has to close the old position.
       const opposes = pos !== undefined && (pos.qty > 0) !== (i.side === 'buy');
-      qty = this.o.sizing.notionalUsd / ref + (opposes ? Math.abs(pos.qty) : 0);
+      qty = this.sizing.notionalUsd / ref + (opposes ? Math.abs(pos.qty) : 0);
     }
     if (binance) qty = floorToStep(qty, rules.stepSize);
     if (!(qty > 0)) return { accepted: false, reason: 'zero_qty_after_rounding' };
@@ -88,7 +150,7 @@ export class PaperBroker {
         // A reversal frees the old position's margin but pays a fee on the closing leg.
         const closeQty = qty - openQty;
         const released = pos && closeQty > 0 ? (pos.margin * closeQty) / Math.abs(pos.qty) : 0;
-        const closeFee = tradeFee(closeQty, ref, this.o.fees.takerRate);
+        const closeFee = tradeFee(closeQty, ref, this.fees.takerRate);
         // Pending opening orders already spoken for part of the free margin.
         if (need > this.account().freeMargin - this.reservedMargin(i.id) + released - closeFee) {
           return { accepted: false, reason: 'no_free_balance' };
@@ -97,7 +159,7 @@ export class PaperBroker {
     }
 
     this.orders = this.orders.filter((x) => x.id !== i.id);
-    this.orders.push({ ...i, qty, seq: this.nextSeq++, submittedAt: now });
+    this.orders.push({ ...i, qty, seq: this.nextSeq++, submittedAt: now, reserveRate: this.fees.takerRate });
     return { accepted: true };
   }
 
@@ -224,6 +286,7 @@ export class PaperBroker {
         delete intent.seq;
         delete intent.submittedAt;
         delete intent.triggered;
+        delete intent.reserveRate;
         return intent as OrderIntent;
       });
   }
@@ -240,12 +303,23 @@ export class PaperBroker {
       orders: this.orders,
       closed: this.closed,
       rejections: this.rejected,
+      realisedNet: this.realised,
+      fees: this.fees,
+      sizing: this.sizing,
     });
   }
 
+  /**
+   * The broker `s` was snapshotted from. Fees and sizing come from the state (they may have been edited
+   * since the run started), else from `o`; older states without running totals rebuild them.
+   */
   static restore(s: BrokerState, o: BrokerOptions): PaperBroker {
     const b = new PaperBroker(o);
     const c = clone(s);
+    if (c.fees) b.fees = c.fees;
+    if (c.sizing) b.sizing = c.sizing;
+    if (c.realisedNet) b.realised = c.realisedNet;
+    else for (const t of c.closed) b.addRealised(t);
     b.balance = c.balance;
     b.feesPaid = c.feesPaid;
     b.fundingNet = c.fundingNet;
@@ -290,7 +364,7 @@ export class PaperBroker {
     const qty = Math.abs(pos.qty);
     const orderId = `liquidation:${symbol}:${time}`;
     this.balance -= pos.margin;
-    this.closed.push({
+    this.pushClosed({
       symbol,
       side: long ? 'long' : 'short',
       entryTime: pos.openTime,
@@ -346,20 +420,29 @@ export class PaperBroker {
     return opposes ? Math.max(0, qty - Math.abs(pos.qty)) : qty;
   }
 
-  private marginAndFee(qty: number, price: number, leverage: number): number {
-    return marginRequired(qty, price, leverage) + tradeFee(qty, price, this.o.fees.takerRate);
+  private marginAndFee(qty: number, price: number, leverage: number, rate = this.fees.takerRate): number {
+    return marginRequired(qty, price, leverage) + tradeFee(qty, price, rate);
   }
 
-  /** Margin + entry fee that pending opening orders (other than `excludeId`) will need. */
+  /** Margin + entry fee that pending opening orders (other than `excludeId`) will need, each at the fee it was accepted with. */
   private reservedMargin(excludeId: string): number {
     let sum = 0;
     for (const x of this.orders) {
       if (x.id === excludeId || this.isReduce(x)) continue;
       const price = this.lastPrice[x.symbol];
       if (price === undefined) continue;
-      sum += this.marginAndFee(this.openingQty(x, x.qty), price, x.leverage);
+      sum += this.marginAndFee(this.openingQty(x, x.qty), price, x.leverage, x.reserveRate);
     }
     return sum;
+  }
+
+  private pushClosed(t: ClosedTrade): void {
+    this.closed.push(t);
+    this.addRealised(t);
+  }
+
+  private addRealised(t: ClosedTrade): void {
+    this.realised[t.symbol] = (this.realised[t.symbol] ?? 0) + (t.pnl - t.fees + t.funding);
   }
 
   /** A reduce-only/exit order can only act while there is an opposing position to reduce. */
@@ -457,11 +540,11 @@ export class PaperBroker {
     const maker = ord.type === 'limit' || (ord.type === 'stop_limit' && ord.triggered === true);
     let price = refPrice;
     if (!maker) {
-      const ticks = this.o.fees.slippageTicks;
+      const ticks = this.fees.slippageTicks;
       price =
         ticks !== undefined
           ? refPrice + (ord.side === 'buy' ? 1 : -1) * ticks * this.o.rules(ord.symbol).tickSize
-          : fillPrice(refPrice, ord.side, this.o.fees.slippagePct);
+          : fillPrice(refPrice, ord.side, this.fees.slippagePct);
       if (this.o.mode === 'binance') {
         price = roundToTick(price, this.o.rules(ord.symbol).tickSize, ord.side === 'buy' ? 'up' : 'down');
       }
@@ -472,15 +555,15 @@ export class PaperBroker {
       if (openQty > 0) {
         const closeQty = qty - openQty;
         const released = pos && closeQty > 0 ? (pos.margin * closeQty) / Math.abs(pos.qty) : 0;
-        const closeFee = tradeFee(closeQty, price, maker ? this.o.fees.makerRate : this.o.fees.takerRate);
-        const need = marginRequired(openQty, price, ord.leverage) + tradeFee(openQty, price, this.o.fees.takerRate);
+        const closeFee = tradeFee(closeQty, price, maker ? this.fees.makerRate : this.fees.takerRate);
+        const need = marginRequired(openQty, price, ord.leverage) + tradeFee(openQty, price, this.fees.takerRate);
         if (need > this.account().freeMargin + released - closeFee) {
           this.rejected.push({ orderId: ord.id, symbol: ord.symbol, time, reason: 'no_free_balance' });
           return null;
         }
       }
     }
-    const fee = tradeFee(qty, price, maker ? this.o.fees.makerRate : this.o.fees.takerRate);
+    const fee = tradeFee(qty, price, maker ? this.fees.makerRate : this.fees.takerRate);
     const reason: ExitReason =
       ord.type === 'stop' || ord.type === 'stop_limit' ? 'stop' : ord.type === 'limit' && ord.tag === 'exit' ? 'target' : 'signal';
 
@@ -520,7 +603,7 @@ export class PaperBroker {
     const funding = m.funding * frac;
     const pnl = closeQty * (price - pos.entryPrice) * Math.sign(pos.qty);
     this.balance += pnl;
-    this.closed.push({
+    this.pushClosed({
       symbol: sym,
       side: pos.qty > 0 ? 'long' : 'short',
       entryTime: pos.openTime,

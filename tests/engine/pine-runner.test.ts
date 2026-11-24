@@ -117,6 +117,7 @@ describe('compileScript', () => {
         processOrdersOnClose: false,
         overridden: { initialCapital: 10_000, commission: 0.05, slippage: 2 },
       },
+      securityTimeframes: ['D'],
     });
     const p = await compileScript(probe('01-ma-cross'));
     expect(p).toMatchObject({ ok: true, declaration: { defaultQtyType: 'percent_of_equity', defaultQtyValue: 100, marginLong: 100, overridden: { initialCapital: 10_000, commission: 0.05, slippage: 0 } } });

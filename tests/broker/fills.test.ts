@@ -187,3 +187,96 @@ describe('PaperBroker fills', () => {
     expect(b.closedTrades()[0]!.qty).toBeCloseTo(0.1, 10);
   });
 });
+
+describe('PaperBroker live support: forceClose, setFees, setSizing, realisedNet', () => {
+  it('forceClose books a delisting trade', () => {
+    const b = make();
+    b.markToMarket('ETHUSDT', 2000);
+    b.submit(order({ id: 'e', qty: 0.1 }), 0);
+    b.onBarOpen('BTCUSDT', bar(50000, 50000, 50000, 50000, 1000)); // long 0.1 @ 50010 (slippage), fee 2.5005
+    b.submit(order({ id: 'sl', side: 'sell', type: 'stop', stopPrice: 45000, reduceOnly: true, tag: 'exit' }), 1000);
+    b.submit(order({ id: 'add', type: 'limit', limitPrice: 40000 }), 1000);
+    b.submit(order({ id: 'other', symbol: 'ETHUSDT', type: 'limit', limitPrice: 1 }), 1000);
+    const fills = b.forceClose('BTCUSDT', 49000, 2000, 'delisting');
+    // No slippage, the taker fee.
+    expect(fills).toEqual([
+      { orderId: 'delisting:BTCUSDT:2000', symbol: 'BTCUSDT', time: 2000, price: 49000, qty: 0.1, side: 'sell', fee: 0.1 * 49000 * 0.0005, liquidity: 'taker' },
+    ]);
+    const t = b.closedTrades()[0]!;
+    expect(t).toMatchObject({ symbol: 'BTCUSDT', side: 'long', exitPrice: 49000, exitTime: 2000, qty: 0.1, exitReason: 'delisting', exitOrderId: 'delisting:BTCUSDT:2000' });
+    expect(t.pnl).toBeCloseTo(-101, 8);
+    expect(t.fees).toBeCloseTo(2.5005 + 2.45, 10);
+    expect(b.position('BTCUSDT')).toBeNull();
+    expect(b.openOrders('BTCUSDT')).toEqual([]);
+    expect(b.openOrders().map((o) => o.id)).toEqual(['other']);
+    expect(b.account().balance).toBeCloseTo(10_000 - 2.5005 - 101 - 2.45, 8);
+    expect(b.realisedNet('BTCUSDT')).toBe(t.pnl - t.fees + t.funding);
+  });
+
+  it('forceClose with no position only cancels the orders', () => {
+    const b = make();
+    b.submit(order({ id: 'lim', type: 'limit', limitPrice: 40000 }), 0);
+    expect(b.forceClose('BTCUSDT', 50000, 2000, 'delisting')).toEqual([]);
+    expect(b.openOrders()).toEqual([]);
+    expect(b.closedTrades()).toEqual([]);
+  });
+
+  it('setFees applies from the next fill only', () => {
+    const b = make();
+    b.submit(order({ id: 'e', qty: 0.1 }), 0);
+    b.onBarOpen('BTCUSDT', bar(50000, 50000, 50000, 50000, 1000));
+    const feesBefore = b.account().feesPaid;
+    b.submit(order({ id: 'x', side: 'sell', reduceOnly: true, tag: 'exit' }), 1000);
+    b.setFees({ makerRate: 0, takerRate: 0.001, slippagePct: 0 });
+    // A fill already made keeps its fee; the pending order fills with the new fees.
+    expect(b.account().feesPaid).toBe(feesBefore);
+    const [f] = b.onBarOpen('BTCUSDT', bar(50000, 50000, 50000, 50000, 2000));
+    expect(f).toMatchObject({ price: 50000, fee: 0.1 * 50000 * 0.001 });
+    expect(b.closedTrades()[0]!.fees).toBeCloseTo(2.5005 + 5, 10);
+    // The edit survives a restart.
+    const r = PaperBroker.restore(JSON.parse(JSON.stringify(b.snapshot())), opts());
+    r.submit(order({ id: 'e2', qty: 0.1 }), 2000);
+    expect(r.onBarOpen('BTCUSDT', bar(50000, 50000, 50000, 50000, 3000))[0]).toMatchObject({ price: 50000, fee: 0.1 * 50000 * 0.001 });
+  });
+
+  it('setFees keeps the reservation a pending opening order already holds', () => {
+    const b = new PaperBroker({ ...opts(), startingBalance: 1_000 });
+    b.markToMarket('BTCUSDT', 50000);
+    // 0.1 @ 50000, 10x: margin 500 + fee 2.5 = 502.5 reserved, 497.5 left.
+    expect(b.submit(order({ id: 'a', type: 'limit', limitPrice: 40000, qty: 0.1 }), 0)).toEqual({ accepted: true });
+    b.setFees({ ...DEFAULT_FEES, takerRate: 0.01 });
+    // At the new fee 0.09 needs 450 + 45 = 495: it fits only while 'a' still reserves 502.5 (not 550).
+    expect(b.submit(order({ id: 'b', type: 'limit', limitPrice: 40000, qty: 0.09 }), 0)).toEqual({ accepted: true });
+    expect(b.submit(order({ id: 'c', type: 'limit', limitPrice: 40000, qty: 0.003 }), 0)).toEqual({ accepted: false, reason: 'no_free_balance' });
+  });
+
+  it('setSizing applies from the next submit; orders already queued keep their qty', () => {
+    const b = make();
+    b.submit(order({ id: 'a', type: 'limit', limitPrice: 40000, qty: 0.1 }), 0);
+    b.setSizing({ kind: 'fixed', notionalUsd: 1000 });
+    b.submit(order({ id: 'b', type: 'limit', limitPrice: 40000, qty: 0.5 }), 0);
+    expect(b.openOrders().map((o) => [o.id, o.qty])).toEqual([['a', 0.1], ['b', 0.02]]);
+    expect(b.sizingRule()).toEqual({ kind: 'fixed', notionalUsd: 1000 });
+    const r = PaperBroker.restore(JSON.parse(JSON.stringify(b.snapshot())), opts());
+    expect(r.sizingRule()).toEqual({ kind: 'fixed', notionalUsd: 1000 });
+  });
+
+  it('realisedNet keeps a running per-symbol total of closed trades, also across a restore', () => {
+    const b = make('tradingview');
+    for (let i = 0; i < 3; i++) {
+      b.submit(order({ id: `e${i}`, qty: 0.1 }), 0);
+      b.onBarOpen('BTCUSDT', bar(100 + i, 100 + i, 100 + i, 100 + i, 1000 + i));
+      b.submit(order({ id: `x${i}`, side: 'sell', qty: 0.1, reduceOnly: true, tag: 'exit' }), 0);
+      b.onBarOpen('BTCUSDT', bar(110 - i, 110 - i, 110 - i, 110 - i, 2000 + i));
+    }
+    let want = 0;
+    for (const t of b.closedTrades()) want += t.pnl - t.fees + t.funding;
+    expect(b.realisedNet('BTCUSDT')).toBe(want);
+    expect(b.realisedNet('ETHUSDT')).toBe(0);
+    const s = JSON.parse(JSON.stringify(b.snapshot()));
+    expect(PaperBroker.restore(s, opts('tradingview')).realisedNet('BTCUSDT')).toBe(want);
+    // An older state without the running totals rebuilds them from its closed trades.
+    delete s.realisedNet;
+    expect(PaperBroker.restore(s, opts('tradingview')).realisedNet('BTCUSDT')).toBe(want);
+  });
+});

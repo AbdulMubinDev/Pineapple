@@ -61,7 +61,15 @@ export interface StrategyDeclaration {
 
 export type CompileError = { line: number; message: string };
 export type CompileWarning = { line: number; message: string };
-export type CompileResult = { ok: true; declaration: StrategyDeclaration; warnings?: CompileWarning[] } | { ok: false; errors: CompileError[] };
+export type CompileResult =
+  | {
+      ok: true;
+      declaration: StrategyDeclaration;
+      /** The timeframe of every request.security call, as written ('D', '240', ...), deduplicated in order of first use. */
+      securityTimeframes: string[];
+      warnings?: CompileWarning[];
+    }
+  | { ok: false; errors: CompileError[] };
 
 export interface BarHooks {
   before(bar: Candle, idx: number): ScriptView;
@@ -286,39 +294,100 @@ const VALIDATION_BARS = 300;
 
 type SecurityCall = { line: number; text: string };
 
+/** The text of the call starting at line `i`, column `start`, up to its closing paren (it may span lines). */
+function callTextAt(lines: string[], i: number, start: number): string {
+  let depth = 0;
+  let text = '';
+  let quote: string | null = null;
+  for (let li = i; li < lines.length; li++) {
+    const src = li === i ? lines[li]!.slice(start) : lines[li]!;
+    for (let k = 0; k < src.length; k++) {
+      const ch = src[k]!;
+      text += ch;
+      if (quote) {
+        if (ch === '\\') text += src[++k] ?? '';
+        else if (ch === quote) quote = null;
+      } else if (ch === '"' || ch === "'") quote = ch;
+      else if (ch === '(') depth++;
+      else if (ch === ')' && --depth === 0) return text;
+    }
+    text += '\n';
+  }
+  return text;
+}
+
 /** Every request.security(...) call (comments blanked, strings kept): its first line and its text up to the closing paren. */
 function securityCalls(lines: string[]): SecurityCall[] {
   const calls: SecurityCall[] = [];
   lines.forEach((l, i) => {
-    for (const m of l.matchAll(/(?<![\w.])request\.security\s*\(/g)) {
-      let depth = 0;
-      let text = '';
-      let quote: string | null = null;
-      scan: for (let li = i; li < lines.length; li++) {
-        const src = li === i ? lines[li]!.slice(m.index) : lines[li]!;
-        for (let k = 0; k < src.length; k++) {
-          const ch = src[k]!;
-          text += ch;
-          if (quote) {
-            if (ch === '\\') text += src[++k] ?? '';
-            else if (ch === quote) quote = null;
-          } else if (ch === '"' || ch === "'") quote = ch;
-          else if (ch === '(') depth++;
-          else if (ch === ')' && --depth === 0) break scan;
-        }
-        text += '\n';
-      }
-      calls.push({ line: i + 1, text });
-    }
+    for (const m of l.matchAll(/(?<![\w.])request\.security\s*\(/g)) calls.push({ line: i + 1, text: callTextAt(lines, i, m.index) });
   });
   return calls;
 }
 
 const stringLiteral = (s: string) => /^\s*(["'])(.*)\1\s*$/s.exec(s)?.[2];
+/** A single string literal and nothing else (no concatenation, no escapes). */
+const plainLiteral = (s: string) => /^\s*(?:"([^"\\]*)"|'([^'\\]*)')\s*$/.exec(s)?.slice(1).find((x) => x !== undefined);
 
-/** The call's arguments as written, split at top-level commas. */
-function securityArgs(call: SecurityCall): string[] {
-  const inner = call.text.slice(call.text.indexOf('(') + 1);
+/** A call argument: by name if passed as `name = ...`, else the positional one at `index`. */
+function callArg(args: string[], name: string, index: number): string | undefined {
+  const named = (a: string) => /^\s*([A-Za-z_]\w*)\s*=(?!=)([\s\S]*)$/.exec(a);
+  for (const a of args) {
+    const m = named(a);
+    if (m && m[1] === name) return m[2];
+  }
+  const positional = args.filter((a) => !named(a));
+  return positional[index];
+}
+
+/**
+ * The timeframe a request.security argument names, if it is known before the run: a string literal,
+ * timeframe.period (the chart's), or a variable assigned once from a literal or from an input's default
+ * (input.timeframe("D", ...)). Anything else (a runtime expression, a reassigned variable) is undefined.
+ */
+function literalTimeframe(expr: string, lines: string[], tf: Timeframe): string | undefined {
+  const lit = plainLiteral(expr);
+  if (lit !== undefined) return lit;
+  const name = expr.trim();
+  if (name === 'timeframe.period') return pineTimeframe(tf);
+  if (!/^[A-Za-z_]\w*$/.test(name)) return undefined;
+  if (lines.some((l) => new RegExp(`(?<![\\w.])${name}\\s*:=`).test(l))) return undefined;
+  const decl = new RegExp(`^\\s*(?:(?:var|varip|const|simple|series)\\s+)*(?:string\\s+)?${name}\\s*=(?!=)`);
+  const at = lines.flatMap((l, i) => {
+    const m = decl.exec(l);
+    return m ? [{ i, col: m[0].length }] : [];
+  });
+  if (at.length !== 1) return undefined;
+  const { i, col } = at[0]!;
+  const rhs = lines[i]!.slice(col);
+  const direct = plainLiteral(rhs);
+  if (direct !== undefined) return direct;
+  if (!/^\s*input(?:\.timeframe|\.string)?\s*\(/.test(rhs)) return undefined;
+  const text = callTextAt(lines, i, col);
+  // Nothing may follow the input call (input.timeframe("D") + "x" is an expression).
+  const parts = text.split('\n');
+  const last = parts.length === 1 ? rhs : lines[i + parts.length - 1]!;
+  if (last.slice(parts.at(-1)!.length).trim() !== '') return undefined;
+  const v = callArg(callArgs(text), 'defval', 0);
+  return v === undefined ? undefined : plainLiteral(v);
+}
+
+/** The timeframes of `calls` as written (deduplicated, in order of first use), and the calls whose timeframe is not known. */
+function securityTimeframesOf(calls: SecurityCall[], lines: string[], tf: Timeframe): { timeframes: string[]; errors: CompileError[] } {
+  const timeframes: string[] = [];
+  const errors: CompileError[] = [];
+  for (const c of calls) {
+    const arg = callArg(callArgs(c.text), 'timeframe', 1);
+    const t = arg === undefined ? undefined : literalTimeframe(arg, lines, tf);
+    if (t === undefined) errors.push({ line: c.line, message: `request.security timeframe on line ${c.line} must be a literal in v1` });
+    else if (!timeframes.includes(t)) timeframes.push(t);
+  }
+  return { timeframes, errors };
+}
+
+/** A call's arguments as written, split at top-level commas. */
+function callArgs(text: string): string[] {
+  const inner = text.slice(text.indexOf('(') + 1);
   const args: string[] = [];
   let depth = 0;
   let quote: string | null = null;
@@ -349,18 +418,19 @@ function securityArgs(call: SecurityCall): string[] {
 }
 
 /** The request.security call a MemoryProvider error belongs to, else the first call, else 0. */
-function securityErrorLine(calls: SecurityCall[], message: string): number {
+function securityErrorLine(calls: SecurityCall[], message: string, symbol: string): number {
   if (calls.length === 0) return 0;
   if (message === OTHER_SYMBOL_MESSAGE) {
+    const own = new RegExp(`^(?:BINANCE:)?${escape(symbol)}(?:\\.P)?$`, 'i');
     const other = calls.find((c) => {
-      const sym = stringLiteral(securityArgs(c)[0] ?? '');
-      return sym !== undefined && !/^(?:BINANCE:)?BTCUSDT(?:\.P)?$/i.test(sym);
+      const sym = stringLiteral(callArg(callArgs(c.text), 'symbol', 0) ?? '');
+      return sym !== undefined && !own.test(sym);
     });
     return (other ?? calls[0]!).line;
   }
   const tf = /cannot build (\S+) candles/.exec(message)?.[1];
   if (tf) {
-    const hit = calls.find((c) => stringLiteral(securityArgs(c)[1] ?? '')?.toUpperCase() === tf.toUpperCase());
+    const hit = calls.find((c) => stringLiteral(callArg(callArgs(c.text), 'timeframe', 1) ?? '')?.toUpperCase() === tf.toUpperCase());
     if (hit) return hit.line;
   }
   return calls[0]!.line;
@@ -373,8 +443,8 @@ function lookaheadWarnings(calls: SecurityCall[]): CompileWarning[] {
     .map((c) => ({ line: c.line, message: 'request.security with lookahead_on and no [1] offset uses unclosed higher-timeframe data' }));
 }
 
-function errorLine(lines: string[], message: string, calls: SecurityCall[] = []): number {
-  if (message === OTHER_SYMBOL_MESSAGE || /^MemoryProvider /.test(message)) return securityErrorLine(calls, message);
+function errorLine(lines: string[], message: string, calls: SecurityCall[] = [], symbol = 'BTCUSDT'): number {
+  if (message === OTHER_SYMBOL_MESSAGE || /^MemoryProvider /.test(message)) return securityErrorLine(calls, message, symbol);
   const pos = /\bat (\d+):\d+/.exec(message);
   if (pos) return Number(pos[1]);
   const undeclared = /^Undeclared identifier "([^"]+)"/.exec(message);
@@ -411,12 +481,14 @@ function readDeclaration(ind: Indicator): StrategyDeclaration {
 }
 
 /**
- * Validates a pasted script. Async because the last check runs it (PineTS runs are async): unknown
- * functions and unsupported data requests only show up then.
+ * Validates a pasted script for `symbol`'s `tf` chart (request.security on that symbol is its own).
+ * Async because the last check runs it (PineTS runs are async): unknown functions and unsupported data
+ * requests only show up then.
  */
-export async function compileScript(source: string, tf: Timeframe = '4h'): Promise<CompileResult> {
+export async function compileScript(source: string, tf: Timeframe = '4h', symbol = 'BTCUSDT'): Promise<CompileResult> {
   const lines = codeLines(source);
-  const calls = securityCalls(codeLines(source, true));
+  const withStrings = codeLines(source, true);
+  const calls = securityCalls(withStrings);
   const fail = (errors: CompileError[]): CompileResult => ({ ok: false, errors: errors.sort((a, b) => a.line - b.line) });
 
   const ind = new Indicator(source);
@@ -447,6 +519,9 @@ export async function compileScript(source: string, tf: Timeframe = '4h'): Promi
   });
   const immediately = lineOf(lines, /(?<![\w.])immediately\s*=\s*true\b/);
   if (immediately > 0) errors.push({ line: immediately, message: 'strategy.close(immediately = true) is not supported in v1' });
+  // The live engine loads each higher timeframe up front, so it has to know them before the run.
+  const security = securityTimeframesOf(calls, withStrings, tf);
+  errors.push(...security.errors);
   if (errors.length > 0) return fail(errors);
 
   const declaration = readDeclaration(ind);
@@ -462,7 +537,7 @@ export async function compileScript(source: string, tf: Timeframe = '4h'): Promi
   try {
     const ctx = await execute({
       source,
-      symbol: 'BTCUSDT',
+      symbol,
       tf,
       candles: syntheticCandles(VALIDATION_BARS, tf),
       syminfo: { mintick: 0.1, qtyStep: 0.001 },
@@ -473,9 +548,10 @@ export async function compileScript(source: string, tf: Timeframe = '4h'): Promi
     for (const m of methods) errors.push({ line: tokenLine(lines, m), message: `${m} is not supported in v1` });
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
-    errors.push({ line: errorLine(lines, message, calls), message });
+    errors.push({ line: errorLine(lines, message, calls, symbol), message });
   }
   if (errors.length > 0) return fail(errors);
   const warnings = lookaheadWarnings(calls);
-  return warnings.length > 0 ? { ok: true, declaration, warnings } : { ok: true, declaration };
+  const ok = { ok: true as const, declaration, securityTimeframes: security.timeframes };
+  return warnings.length > 0 ? { ...ok, warnings } : ok;
 }
