@@ -25,7 +25,7 @@ const streamBar = (openTime: number): Candle => ({ openTime, open: 1, high: 2, l
 const restBar = (openTime: number): Candle => ({ openTime, open: 8, high: 10, low: 7, close: 9, volume: 4 });
 
 /** `repoLast` overrides the last stored openTime per symbol (default: the bar that closed at B0). */
-function setup(symbols = SYMS, repoLast: Record<string, number> = {}) {
+function setup(symbols = SYMS, repoLast: Record<string, number> = {}, lastCloseTime?: number) {
   const clock = makeClock(START);
   const timers = makeTimers(clock);
   const client = new FakeExchange({ now: clock.now, sleep: clock.sleep });
@@ -37,10 +37,19 @@ function setup(symbols = SYMS, repoLast: Record<string, number> = {}) {
     const last = repoLast[s] ?? B0 - STEP;
     repo.upsert(s, TF, Array.from({ length: 10 }, (_, i) => restBar(last - (9 - i) * STEP)));
   }
-  const feed = new LiveFeed({ client, repo, tf: TF, symbols, now: clock.now, setTimer: timers.setTimer, clearTimer: timers.clearTimer });
-  const closes: { closeTime: number; bars: Map<string, Candle>; missing: string[]; at: number }[] = [];
-  feed.onClose((closeTime, bars, missing) => {
-    closes.push({ closeTime, bars, missing, at: clock.now() });
+  const feed = new LiveFeed({
+    client,
+    repo,
+    tf: TF,
+    symbols,
+    now: clock.now,
+    setTimer: timers.setTimer,
+    clearTimer: timers.clearTimer,
+    ...(lastCloseTime === undefined ? {} : { lastCloseTime }),
+  });
+  const closes: { closeTime: number; bars: Map<string, Candle>; missing: string[]; behind: string[]; at: number }[] = [];
+  feed.onClose((closeTime, bars, info) => {
+    closes.push({ closeTime, bars, missing: info.missing, behind: info.behind, at: clock.now() });
   });
   const errors: unknown[] = [];
   feed.onError((e) => errors.push(e));
@@ -419,6 +428,129 @@ describe('LiveFeed', () => {
     expect(client.calls).toHaveLength(0);
     expect(repo.latest('ETHUSDT', TF)!.openTime).toBe(behind); // nothing stored past the hole (3a)
     expect(errors.filter((e) => e instanceof RepoBehindError)).toHaveLength(1);
+    expect(closes[0]!.behind).toEqual(['ETHUSDT']);
+    expect(closes[0]!.missing).toEqual([]);
+    expect(feed.status().behind).toEqual(['ETHUSDT']);
+    feed.stop();
+  });
+
+  it('12 symbols that never appear still emit within the deadline, all reported missing', async () => {
+    const syms = Array.from({ length: 15 }, (_, i) => `S${i}USDT`);
+    const gone = syms.slice(3);
+    const { client, feed, closes, to, pushAll } = setup(syms);
+    for (const s of gone) client.setCandles(s, TF, []);
+    feed.start();
+    await to(B1 + 300);
+    pushAll(B0, syms.slice(0, 3));
+    await to(B1 + 20 * SEC);
+    expect(closes).toHaveLength(1);
+    expect(closes[0]!.missing.sort()).toEqual([...gone].sort());
+    expect(closes[0]!.at).toBeLessThanOrEqual(B1 + 300 + 10 * SEC);
+    // One shared set of retry rounds, not one per symbol: at most 1 + 3 calls each.
+    for (const s of gone) expect(client.calls.filter((c) => c.url.includes(`symbol=${s}&`)).length).toBeLessThanOrEqual(4);
+    feed.stop();
+  });
+
+  it('retry rounds stop at the pass deadline even when REST is slow', async () => {
+    const { client, feed, closes, to, pushAll } = setup();
+    client.setCandles('SOLUSDT', TF, []);
+    client.script({ status: 429, retryAfter: 3 }); // the first fetch spends 3 s in back-off
+    feed.start();
+    await to(B1 + 300);
+    pushAll(B0, ['BTCUSDT', 'ETHUSDT']);
+    await to(B1 + 20 * SEC);
+    expect(closes).toHaveLength(1);
+    expect(closes[0]!.missing).toEqual(['SOLUSDT']);
+    expect(closes[0]!.at).toBeLessThanOrEqual(B1 + 300 + 10 * SEC);
+    feed.stop();
+  });
+
+  it('after a failed batch, a close that becomes complete still waits RETRY_MS', async () => {
+    const { client, feed, closes, to, pushAll } = setup();
+    client.failKlines('SOLUSDT', 503);
+    feed.start();
+    await to(B1 + 300);
+    pushAll(B0, ['BTCUSDT', 'ETHUSDT']);
+    await to(B1 + 3500); // the 3 s deadline batch failed at B1 + 3.3 s
+    expect(feed.status().catchingUp).toBe(true);
+    pushAll(B0, ['SOLUSDT']); // now complete from the stream alone
+    await to(B1 + 5 * SEC);
+    expect(closes).toHaveLength(0);
+    await to(B1 + 15 * SEC);
+    expect(closes.map((c) => c.closeTime)).toEqual([B1]);
+    expect(closes[0]!.bars.get('SOLUSDT')).toEqual(streamBar(B0));
+    feed.stop();
+  });
+
+  it('a permanent exchange hole 20 bars back costs one fetch and no retries', async () => {
+    const hole = B0 - 20 * STEP;
+    const { client, feed, closes, to, pushAll } = setup(SYMS, { ETHUSDT: hole - STEP });
+    client.setCandles(
+      'ETHUSDT',
+      TF,
+      Array.from({ length: 200 }, (_, i) => restBar(B0 - 100 * STEP + i * STEP)).filter((c) => c.openTime !== hole),
+    );
+    feed.start();
+    await to(B1 + 500);
+    pushAll(B0);
+    await flush();
+    expect(closes).toHaveLength(1);
+    expect(closes[0]!.at).toBe(B1 + 500); // no retry wait
+    expect(closes[0]!.missing).toEqual([]);
+    expect(client.calls.filter((c) => c.url.includes('ETHUSDT'))).toHaveLength(1);
+    feed.stop();
+  });
+
+  it('bars already stored for part of the batch are emitted, not reported missing', async () => {
+    // The feed resumes 3 closes back; loadHistory already stored the first two of those bars.
+    const { client, feed, closes, errors, to } = setup(SYMS, { BTCUSDT: B0 - 2 * STEP, ETHUSDT: B0 - 2 * STEP, SOLUSDT: B0 - 2 * STEP }, B0 - 3 * STEP);
+    feed.start();
+    await to(START + 5 * SEC);
+    expect(closes.map((c) => c.closeTime)).toEqual([B0 - 2 * STEP, B0 - STEP, B0]);
+    for (const c of closes) {
+      expect(c.missing).toEqual([]);
+      expect(c.bars.size).toBe(3);
+    }
+    expect(errors.some((e) => e instanceof MissingBarsError)).toBe(false);
+    // Only the bar the repo did not have was fetched.
+    for (const c of client.calls) expect(new URL(c.url).searchParams.get('startTime')).toBe(String(B0 - STEP));
+    feed.stop();
+  });
+
+  it('a new generation opened at C + 1 s catches up C by C + 3 s', async () => {
+    const { client, feed, closes, to, pushAll } = setup();
+    feed.start();
+    const B2 = B1 + STEP;
+    for (let t = START + 30 * SEC; t <= B2; t += 30 * SEC) {
+      await to(t);
+      client.pushKline('BTCUSDT', TF, streamBar(barOpenFor(t, TF)), false);
+      if (t === B1) pushAll(B0);
+    }
+    expect(closes.map((c) => c.closeTime)).toEqual([B1]);
+    await to(B2 + SEC);
+    feed.setSymbols(['BTCUSDT', 'ETHUSDT']); // B2's closed klines were lost in the switch
+    await to(B2 + 3 * SEC);
+    expect(closes.map((c) => c.closeTime)).toEqual([B1, B2]);
+    expect(closes[1]!.missing).toEqual([]);
+    feed.stop();
+  });
+
+  it('a non-HTTP failure repeating for one symbol on 3 batches marks it missing instead of stalling closes', async () => {
+    const { client, feed, closes, to, pushAll } = setup();
+    client.failKlines('SOLUSDT', 'nonjson');
+    feed.start();
+    await to(B1 + 300);
+    pushAll(B0, ['BTCUSDT', 'ETHUSDT']);
+    await to(B1 + 40 * SEC);
+    expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([[B1, ['SOLUSDT']]]);
+    const B2 = B1 + STEP;
+    await to(B2 + 300);
+    pushAll(B1, ['BTCUSDT', 'ETHUSDT']);
+    await to(B2 + 3500);
+    expect(closes.map((c) => [c.closeTime, c.missing])).toEqual([
+      [B1, ['SOLUSDT']],
+      [B2, ['SOLUSDT']],
+    ]);
     feed.stop();
   });
 

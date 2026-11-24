@@ -55,8 +55,8 @@ export class FakeExchange implements ExchangeClient {
   private readonly candles = new Map<string, Candle[]>();
   private readonly funding = new Map<string, FundingEvent[]>();
   private readonly scripted: ScriptedResponse[] = [];
-  private readonly klineScripts = new Map<string, (number | 'empty')[]>();
-  private readonly klineFailures = new Map<string, number>();
+  private readonly klineScripts = new Map<string, (number | 'empty' | 'nonjson')[]>();
+  private readonly klineFailures = new Map<string, number | 'nonjson'>();
   private readonly deps: PageDeps;
 
   constructor(private readonly o: FakeExchangeOptions) {
@@ -82,13 +82,16 @@ export class FakeExchange implements ExchangeClient {
     this.scripted.push(...responses);
   }
 
-  /** Queue per-symbol kline replies: a status code, or 'empty' for a 200 with no bars. Consumed before `script`. */
-  scriptKlines(symbol: string, ...replies: (number | 'empty')[]): void {
+  /**
+   * Queue per-symbol kline replies: a status code, 'empty' for a 200 with no bars, or 'nonjson' for a 200 whose body
+   * is not JSON (a non-HTTP failure). Consumed before `script`.
+   */
+  scriptKlines(symbol: string, ...replies: (number | 'empty' | 'nonjson')[]): void {
     this.klineScripts.set(symbol, [...(this.klineScripts.get(symbol) ?? []), ...replies]);
   }
 
-  /** Every kline request for `symbol` returns `status` until called again with null. */
-  failKlines(symbol: string, status: number | null): void {
+  /** Every kline request for `symbol` returns `status` (or a non-JSON body) until called again with null. */
+  failKlines(symbol: string, status: number | 'nonjson' | null): void {
     if (status === null) this.klineFailures.delete(symbol);
     else this.klineFailures.set(symbol, status);
   }
@@ -104,6 +107,8 @@ export class FakeExchange implements ExchangeClient {
       let body: unknown = null;
       if (perSymbol === 'empty') {
         body = [];
+      } else if (perSymbol === 'nonjson') {
+        body = null;
       } else if (perSymbol !== undefined) {
         status = perSymbol;
         body = { msg: 'scripted' };

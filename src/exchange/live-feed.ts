@@ -28,6 +28,13 @@ export const REST_SETTLE_MS = 3_000;
  */
 export const MISSING_RETRY_MS: readonly number[] = [1_000, 2_000, 3_000];
 /**
+ * Retry rounds stop by this long after the first kline of the batch's oldest close (or after the batch started), so a
+ * close is never held past the 10 s pass deadline however many symbols are missing.
+ */
+export const RETRY_DEADLINE_MS = 9_500;
+/** The same non-HTTP failure for one symbol on this many batches in a row marks it missing instead of failing the batch. */
+export const ERROR_STREAK_LIMIT = 3;
+/**
  * A gap behind the batch of at most this many bars is fetched and written with it (one small request). A repo further
  * behind is loadHistory's to repair: the feed still emits the bars but does not store them past the hole.
  */
@@ -35,7 +42,14 @@ export const GAP_FILL_BARS = 99;
 const TICK_MS = 5_000;
 const REST_CONCURRENCY = 8;
 
-export type CloseListener = (closeTime: number, bars: Map<string, Candle>, missing: string[]) => void | Promise<unknown>;
+export interface CloseInfo {
+  /** Symbols with no bar for this close (REST had none, or rejected the request). */
+  missing: string[];
+  /** Symbols whose stored history is too far behind to extend: their bars are emitted but not stored; run loadHistory. */
+  behind: string[];
+}
+
+export type CloseListener = (closeTime: number, bars: Map<string, Candle>, info: CloseInfo) => void | Promise<unknown>;
 
 export interface LiveFeedOptions {
   client: ExchangeClient;
@@ -44,7 +58,7 @@ export interface LiveFeedOptions {
   symbols: string[];
   now: () => number;
   setTimer: typeof setTimeout;
-  /** Used by stop() to cancel pending timers. Without it, stopped timers fire and do nothing. */
+  /** Used by stop() to cancel pending timers. Default: the global clearTimeout. */
   clearTimer?: typeof clearTimeout;
   /**
    * The last close already handled (a bar boundary, UTC epoch ms). Closes after it are emitted, backfilled over REST
@@ -60,6 +74,8 @@ export interface LiveFeedStatus {
   catchingUp: boolean;
   /** Symbols with no bar in the last emitted close (REST had none, or rejected the request). */
   missing: string[];
+  /** Symbols whose stored history was too far behind to extend at the last close (see CloseInfo.behind). */
+  behind: string[];
 }
 
 /** A close fired without some symbols' bars. */
@@ -106,6 +122,17 @@ interface Gen {
 interface PendingClose {
   bars: Map<string, Candle>;
   queued: boolean;
+  /** When the first closed kline of this close arrived. */
+  firstAt: number;
+}
+
+interface SymbolPlan {
+  symbol: string;
+  from: number;
+  storable: boolean;
+  bars: Map<number, Candle>;
+  /** REST rejected this symbol for this batch: no retries. */
+  permanent: boolean;
 }
 
 type Rec = Record<string, unknown>;
@@ -167,6 +194,8 @@ export class LiveFeed {
   private inCatchUp = false;
   private failedAt: number | null = null;
   private lastMissing: string[] = [];
+  private lastBehind: string[] = [];
+  private readonly errorStreak = new Map<string, number>();
   private readonly reportedBehind = new Set<string>();
   private lastStaleReconnectAt = -Infinity;
   private work: Promise<void> = Promise.resolve();
@@ -221,7 +250,9 @@ export class LiveFeed {
     this.old = this.cur = null;
     this.pending.clear();
     this.queuedTarget = this.lastEmitted;
-    if (this.o.clearTimer) for (const t of this.timers) this.o.clearTimer(t);
+    this.inCatchUp = false;
+    const clear = this.o.clearTimer ?? clearTimeout;
+    for (const t of this.timers) clear(t);
     this.timers.clear();
     for (const wake of [...this.sleepers]) wake();
   }
@@ -243,6 +274,7 @@ export class LiveFeed {
       lastMessageAt: this.lastMessageAt,
       catchingUp: this.inCatchUp || this.failedAt !== null || this.overdue(),
       missing: [...this.lastMissing],
+      behind: [...this.lastBehind],
     };
   }
 
@@ -394,7 +426,8 @@ export class LiveFeed {
     }
     this.requestCatchUp();
     // A close right at the switch may never arrive on either socket: look for it once REST has it.
-    const next = barOpenFor(now, this.o.tf) + this.step;
+    // The first boundary whose catch-up time (boundary + REST_SETTLE_MS) is still ahead: opening at C + 1 s targets C.
+    const next = barOpenFor(now - REST_SETTLE_MS, this.o.tf) + this.step;
     this.timer(() => this.requestCatchUp(), next + REST_SETTLE_MS - now);
   }
 
@@ -450,7 +483,7 @@ export class LiveFeed {
     if (closeTime <= this.lastEmitted) return; // a repeat of a close already fired
     let p = this.pending.get(closeTime);
     if (!p) {
-      p = { bars: new Map(), queued: false };
+      p = { bars: new Map(), queued: false, firstAt: this.o.now() };
       this.pending.set(closeTime, p);
       this.timer(() => this.enqueue(closeTime), CLOSE_WAIT_MS);
     }
@@ -529,11 +562,13 @@ export class LiveFeed {
 
   /** Fire every close that is due and the stream did not deliver. */
   private requestCatchUp(): void {
-    if (this.symbols.size === 0 || this.failedAt !== null) return;
+    if (this.symbols.size === 0) return;
     this.enqueue(barOpenFor(this.o.now() - REST_SETTLE_MS, this.o.tf), true);
   }
 
   private enqueue(target: number, catchUp = false): void {
+    // After a failed batch every path waits for the watchdog's retry (RETRY_MS), which then catches up in one batch.
+    if (this.failedAt !== null) return;
     if (target <= Math.max(this.lastEmitted, this.queuedTarget)) return;
     this.queuedTarget = target;
     this.work = this.work
@@ -547,66 +582,57 @@ export class LiveFeed {
   }
 
   /**
-   * One symbol's bars for openTimes [lo, hi]: stream bars first, then REST for the rest (retried while REST has no bar).
-   * `write` is what may be stored: contiguous from the newest stored bar, stopping at the first hole.
-   * Throws only on transient errors.
+   * Plan one symbol for openTimes [lo, hi]: bars already stored, stream bars, and where its write may start.
+   * `from` is the first open to fetch or write; `storable` is false when the repo is too far behind to extend.
    */
-  private async resolveSymbol(s: string, lo: number, hi: number): Promise<{ bars: Map<number, Candle>; write: Candle[] }> {
-    const { repo, tf, client } = this.o;
+  private planSymbol(s: string, lo: number, hi: number): SymbolPlan {
+    const { repo, tf } = this.o;
     const step = this.step;
     const latest = repo.latest(s, tf);
     const bars = new Map<number, Candle>();
-    if (latest !== null && latest.openTime >= hi) {
-      for (const c of repo.range(s, tf, lo, hi)) bars.set(c.openTime, c);
-      return { bars, write: [] };
-    }
     let from = lo;
     let storable = true;
     if (latest !== null && latest.openTime + step < lo) {
       if (latest.openTime + step >= lo - GAP_FILL_BARS * step) from = latest.openTime + step; // small gap: fill it now
-      else {
-        storable = false; // too far behind: emit, but leave the repair to loadHistory
-        if (!this.reportedBehind.has(s)) {
-          this.reportedBehind.add(s);
-          this.report(new RepoBehindError(s, latest.openTime));
-        }
-      }
+      else storable = false; // too far behind: emit, but leave the repair to loadHistory
     } else if (latest !== null) {
       from = latest.openTime + step;
+      // Opens in [lo, latest] are already stored (e.g. loadHistory ran ahead of the feed): use them.
+      for (const c of repo.range(s, tf, lo, Math.min(hi, latest.openTime))) bars.set(c.openTime, c);
     }
-    if (storable) this.reportedBehind.delete(s);
-
-    const holes = (): boolean => {
-      for (let t = from; t <= hi; t += step) if (!bars.has(t)) return true;
-      return false;
-    };
-    for (let t = from; t <= hi; t += step) {
+    for (let t = Math.max(from, lo); t <= hi; t += step) {
       const b = this.pending.get(t + step)?.bars.get(s);
       if (b) bars.set(t, b);
     }
-    for (let attempt = 0; holes() && attempt <= MISSING_RETRY_MS.length; attempt++) {
-      if (attempt > 0) await this.sleep(MISSING_RETRY_MS[attempt - 1]!);
-      if (!this.running) break;
-      this.inCatchUp = true;
-      let fetched: Candle[];
-      try {
-        fetched = await client.klines(s, tf, from, hi);
-      } catch (e) {
-        if (!isPermanent(e)) throw e;
-        this.report(e);
-        break; // this symbol is missing for this batch
+    return { symbol: s, from, storable, bars, permanent: false };
+  }
+
+  /** Any open in [from, hi] without a bar (`batchOnly`: only the opens being emitted, [lo, hi]). */
+  private hasHoles(p: SymbolPlan, lo: number, hi: number, batchOnly: boolean): boolean {
+    for (let t = batchOnly ? Math.max(p.from, lo) : p.from; t <= hi; t += this.step) if (!p.bars.has(t)) return true;
+    return false;
+  }
+
+  /** One REST fetch for [from, hi]. Permanent failures mark the symbol missing; transient ones throw. */
+  private async fetchInto(p: SymbolPlan, hi: number): Promise<void> {
+    if (p.from > hi) return;
+    this.inCatchUp = true;
+    let fetched: Candle[];
+    try {
+      fetched = await this.o.client.klines(p.symbol, this.o.tf, p.from, hi);
+    } catch (e) {
+      if (!isPermanent(e)) {
+        const streak = (this.errorStreak.get(p.symbol) ?? 0) + 1;
+        this.errorStreak.set(p.symbol, streak);
+        // The same non-HTTP failure for one symbol, batch after batch (e.g. a malformed reply), stops stalling everyone.
+        if (e instanceof HttpStatusError || streak < ERROR_STREAK_LIMIT) throw e;
       }
-      for (const c of fetched) if (c.openTime >= from && c.openTime <= hi && !bars.has(c.openTime)) bars.set(c.openTime, c);
+      this.report(e);
+      p.permanent = true;
+      return;
     }
-    const write: Candle[] = [];
-    if (storable) {
-      for (let t = from; t <= hi; t += step) {
-        const b = bars.get(t);
-        if (!b) break;
-        write.push(b);
-      }
-    }
-    return { bars, write };
+    this.errorStreak.delete(p.symbol);
+    for (const c of fetched) if (c.openTime >= p.from && c.openTime <= hi && !p.bars.has(c.openTime)) p.bars.set(c.openTime, c);
   }
 
   /** Write and fire every close in (lastEmitted, target], oldest first. Throws (writing nothing) on a transient failure. */
@@ -618,16 +644,48 @@ export class LiveFeed {
     const lo = closes[0]! - step;
     const hi = target - step;
     if (catchUp || closes.length > 1) this.inCatchUp = true;
+    // Retries end by the pass deadline, counted from the first kline of the oldest close in the batch (else from now).
+    const firsts = closes.map((c) => this.pending.get(c)?.firstAt).filter((t): t is number => t !== undefined);
+    const deadline = (firsts.length > 0 ? Math.min(...firsts) : this.o.now()) + RETRY_DEADLINE_MS;
 
     const symbols = [...this.symbols];
-    const resolved = new Map<string, Map<number, Candle>>();
-    const writes = new Map<string, Candle[]>();
-    await forEachLimit(symbols, REST_CONCURRENCY, async (s) => {
-      const r = await this.resolveSymbol(s, lo, hi);
-      resolved.set(s, r.bars);
-      if (r.write.length > 0) writes.set(s, r.write);
-    });
+    const plans = symbols.map((s) => this.planSymbol(s, lo, hi));
+    // One fetch for every symbol with a hole anywhere it may write (gap fill included).
+    await forEachLimit(
+      plans.filter((p) => this.hasHoles(p, lo, hi, false)),
+      REST_CONCURRENCY,
+      (p) => this.fetchInto(p, hi),
+    );
+    // Retry rounds, shared by the whole batch, only for bars being emitted that REST did not have yet.
+    for (const delay of MISSING_RETRY_MS) {
+      const waiting = plans.filter((p) => !p.permanent && this.hasHoles(p, lo, hi, true));
+      if (waiting.length === 0 || !this.running || this.o.now() + delay > deadline) break;
+      await this.sleep(delay);
+      if (!this.running) break;
+      await forEachLimit(waiting, REST_CONCURRENCY, (p) => this.fetchInto(p, hi));
+    }
     if (!this.running) return;
+
+    const writes = new Map<string, Candle[]>();
+    const behind: string[] = [];
+    for (const p of plans) {
+      if (!p.storable) {
+        behind.push(p.symbol);
+        if (!this.reportedBehind.has(p.symbol)) {
+          this.reportedBehind.add(p.symbol);
+          this.report(new RepoBehindError(p.symbol, this.o.repo.latest(p.symbol, this.o.tf)?.openTime ?? 0));
+        }
+        continue;
+      }
+      this.reportedBehind.delete(p.symbol);
+      const write: Candle[] = [];
+      for (let t = p.from; t <= hi; t += step) {
+        const b = p.bars.get(t);
+        if (!b) break; // never store past a hole
+        write.push(b);
+      }
+      if (write.length > 0) writes.set(p.symbol, write);
+    }
     this.o.repo.upsertMany(this.o.tf, writes);
     this.failedAt = null;
 
@@ -636,18 +694,19 @@ export class LiveFeed {
       const open = closeTime - step;
       const bars = new Map<string, Candle>();
       const missing: string[] = [];
-      for (const s of symbols) {
-        const b = resolved.get(s)?.get(open);
-        if (b) bars.set(s, b);
-        else missing.push(s);
+      for (const p of plans) {
+        const b = p.bars.get(open);
+        if (b) bars.set(p.symbol, b);
+        else missing.push(p.symbol);
       }
       this.lastEmitted = closeTime;
       this.lastMissing = missing;
+      this.lastBehind = behind;
       for (const k of [...this.pending.keys()]) if (k <= closeTime) this.pending.delete(k);
       if (missing.length > 0) this.report(new MissingBarsError(closeTime, missing));
       for (const cb of [...this.closeListeners]) {
         try {
-          await cb(closeTime, bars, [...missing]);
+          await cb(closeTime, bars, { missing: [...missing], behind: [...behind] });
         } catch (e) {
           this.report(e);
         }
