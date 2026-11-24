@@ -148,6 +148,34 @@ describe('FundingTracker', () => {
     expect(fundingCalls()).toHaveLength(2);
   });
 
+  it('a run with a lower appliedThrough still gets its events after a higher one was served first', async () => {
+    const { clock, client, tracker, fundingCalls } = setup();
+    client.setFunding('BTCUSDT', [ev(T0), ev(T0 + H8 / 2)]);
+    clock.set(T0 + H8 / 2 + 1_000);
+    tracker.primeFromInterval('BTCUSDT', T0 - H8 / 2, 4);
+    const high = await tracker.due(['BTCUSDT'], clock.now(), () => T0);
+    const low = await tracker.due(['BTCUSDT'], clock.now(), () => T0 - H8 / 2);
+    expect(high.map((r) => r.event.time)).toEqual([T0 + H8 / 2]);
+    expect(low.map((r) => r.event.time)).toEqual([T0, T0 + H8 / 2]);
+    expect(fundingCalls()).toHaveLength(2);
+  });
+
+  it('still returns a stored event while the guard is full', async () => {
+    const { clock, client, repo, tracker, fundingCalls } = setup();
+    const syms = Array.from({ length: 400 }, (_, i) => `S${i}USDT`);
+    for (const s of syms) {
+      client.setFunding(s, [ev(T0)]);
+      tracker.onMark(mark(s, T0));
+    }
+    repo.upsert('LATEUSDT', [ev(T0)]);
+    tracker.onMark(mark('LATEUSDT', T0));
+    clock.set(T0 + 1_000);
+    await tracker.due(syms, clock.now(), none);
+    expect(fundingCalls()).toHaveLength(400);
+    expect(await tracker.due(['LATEUSDT'], clock.now(), none)).toEqual([{ symbol: 'LATEUSDT', event: ev(T0) }]);
+    expect(fundingCalls()).toHaveLength(400);
+  });
+
   it('passes a markPrice of 0 through unchanged', async () => {
     const { clock, client, tracker } = setup();
     client.setFunding('BTCUSDT', [{ time: T0, rate: 0.0001, markPrice: 0 }]);

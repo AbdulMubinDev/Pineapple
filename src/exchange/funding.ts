@@ -15,6 +15,8 @@ const BEFORE_MS = 1000;
 const AFTER_MS = 60_000;
 /** primeFromInterval never queues more than this many past times for one symbol. */
 const MAX_PRIME = 100;
+/** Tracked times, first attempts and give-ups older than this are forgotten. */
+const RETENTION_MS = 30 * 24 * 3_600_000;
 /** Most tracked times / cached events kept per symbol. */
 const MAX_PER_SYMBOL = 1000;
 
@@ -83,13 +85,14 @@ export class FundingTracker {
    * Nothing is marked applied here: the same arguments return the same events again.
    */
   async due(symbols: string[], now: number, appliedThrough: (symbol: string) => number): Promise<DueFunding[]> {
+    this.pruneAttempts(now);
     const work: { symbol: string; st: SymbolState; applied: number }[] = [];
     for (const symbol of symbols) {
       const st = this.symbols.get(symbol);
       if (!st) continue;
       const applied = appliedThrough(symbol);
       if (applied < st.minApplied) st.minApplied = applied;
-      this.prune(st);
+      this.prune(st, now);
       work.push({ symbol, st, applied });
     }
     // Least recently attempted first, so retries of an unpublished event cannot starve other symbols.
@@ -98,22 +101,20 @@ export class FundingTracker {
     work.sort((a, b) => a.st.lastAttempt - b.st.lastAttempt || oldestUnresolved(a) - oldestUnresolved(b));
 
     const out: DueFunding[] = [];
-    let guardFull = false;
     for (const { symbol, st, applied } of work) {
       for (const t of [...st.times].sort((a, b) => a - b)) {
         if (t > now) break;
         if (t <= applied) continue;
         let event = st.events.get(t);
-        if (!event && !guardFull) {
+        if (!event) {
           const key = `${symbol}|${t}`;
           const first = this.firstAttempt.get(key);
           if (first !== undefined && now - first > GIVE_UP_MS) {
             this.giveUp(symbol, st, t);
             continue;
           }
-          event = await this.resolve(symbol, st, t, now, () => {
-            guardFull = true;
-          });
+          // The repo is read first; only an actual fetch is subject to the guard (a full guard yields undefined).
+          event = await this.resolve(symbol, st, t, now);
         }
         if (event && event.time > applied) out.push({ symbol, event });
       }
@@ -125,26 +126,23 @@ export class FundingTracker {
     return this.o.repo.range(symbol, fromMs, toMs);
   }
 
-  private resolve(symbol: string, st: SymbolState, t: number, now: number, onGuardFull: () => void): Promise<FundingEvent | undefined> {
+  private resolve(symbol: string, st: SymbolState, t: number, now: number): Promise<FundingEvent | undefined> {
     const key = `${symbol}|${t}`;
     const running = this.inflight.get(key);
     if (running) return running;
-    const p = this.lookup(symbol, st, t, now, onGuardFull).finally(() => this.inflight.delete(key));
+    const p = this.lookup(symbol, st, t, now).finally(() => this.inflight.delete(key));
     this.inflight.set(key, p);
     return p;
   }
 
-  private async lookup(symbol: string, st: SymbolState, t: number, now: number, onGuardFull: () => void): Promise<FundingEvent | undefined> {
+  private async lookup(symbol: string, st: SymbolState, t: number, now: number): Promise<FundingEvent | undefined> {
     // Stored by the history loader, catch-up or an earlier run: use it without REST.
     const stored = this.o.repo.range(symbol, t - BEFORE_MS, t + AFTER_MS)[0];
     if (stored) {
       st.events.set(t, stored);
       return stored;
     }
-    if (!this.takeCall(now)) {
-      onGuardFull();
-      return undefined;
-    }
+    if (!this.takeCall(now)) return undefined;
     const key = `${symbol}|${t}`;
     if (!this.firstAttempt.has(key)) this.firstAttempt.set(key, now);
     st.lastAttempt = now;
@@ -176,10 +174,14 @@ export class FundingTracker {
     st.times.add(t);
   }
 
-  /** Drops times and events nobody can ask for any more, and caps the per-symbol size. */
-  private prune(st: SymbolState): void {
+  /**
+   * Bounds memory. Times are kept by age (30 days) and count only, never by what callers pass, so a run with a lower
+   * appliedThrough still finds its events (from the repo when the cache dropped them). Only the event cache is pruned
+   * by appliedThrough.
+   */
+  private prune(st: SymbolState, now: number): void {
     for (const t of st.times) {
-      if (t <= st.minApplied) {
+      if (t < now - RETENTION_MS) {
         st.times.delete(t);
         st.events.delete(t);
       }
@@ -190,6 +192,14 @@ export class FundingTracker {
         st.events.delete(t);
       }
     }
+    for (const t of st.events.keys()) if (t <= st.minApplied) st.events.delete(t);
+  }
+
+  /** Drops firstAttempt and gaveUp entries for funding times past the retention. */
+  private pruneAttempts(now: number): void {
+    const old = (key: string): boolean => Number(key.slice(key.lastIndexOf('|') + 1)) < now - RETENTION_MS;
+    for (const k of this.firstAttempt.keys()) if (old(k)) this.firstAttempt.delete(k);
+    for (const k of this.gaveUp) if (old(k)) this.gaveUp.delete(k);
   }
 
   /** Reserves one fundingHistory call in the rolling window; false when the window is full. */
