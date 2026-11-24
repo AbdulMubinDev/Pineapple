@@ -3,7 +3,7 @@
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { isTimeframe } from '../core/timeframe.js';
-import { fetchFundingHistory, fetchKlines } from '../data/binance-rest.js';
+import { BinanceClient } from '../exchange/binance.js';
 import { loadCandles, writeCandles, writeFunding } from '../data/csv.js';
 
 const DAY_MS = 86_400_000;
@@ -34,17 +34,18 @@ async function main(): Promise<void> {
   if (toMs < fromMs) throw new Error('--to is before --from');
   const outDir = values.out ?? 'data';
 
-  const candlePath = join(outDir, `${symbol}_${tf}.csv`);
+  const client = new BinanceClient(); // paces every request through the REST weight budget
+  const candlePath =join(outDir, `${symbol}_${tf}.csv`);
   const fundingPath = join(outDir, `${symbol}_funding.csv`);
 
   console.log(`Fetching ${symbol} ${tf} klines ${values.from} -> ${values.to} ...`);
-  const candles = await fetchKlines(symbol, tf, fromMs, toMs);
+  const candles = await client.klines(symbol, tf, fromMs, toMs);
   writeCandles(candlePath, candles);
   loadCandles(candlePath, tf); // throws DataGapError if the recording has a hole
   console.log(`  wrote ${candles.length} candles to ${candlePath} (gap check passed)`);
 
   console.log(`Fetching ${symbol} funding history ...`);
-  const funding = await fetchFundingHistory(symbol, fromMs, toMs);
+  const funding = await client.fundingHistory(symbol, fromMs, toMs);
   writeFunding(fundingPath, funding);
   console.log(`  wrote ${funding.length} funding events to ${fundingPath}`);
 }
