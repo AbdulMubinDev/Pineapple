@@ -1,10 +1,11 @@
-// Fetches each settled funding event exactly once, only for the symbols the caller asks about.
-// The mark stream tells us each pair's next funding time; once it has passed we ask REST for the settled rate.
+// Supplies settled funding events, fetching each from REST at most once, only for the symbols the caller asks about.
+// The mark stream tells us each pair's next funding time; once it has passed we look the event up in the repo, else ask REST.
+// The tracker never decides what has been applied: the caller passes `appliedThrough` and commits its own progress.
 import type { FundingEvent } from '../core/types.js';
 import type { ExchangeClient, MarkUpdate } from './client.js';
 import type { FundingRepo } from '../store/candles.js';
 
-/** How long after its funding time we keep asking for an unpublished event before giving up. */
+/** How long after the first fetch attempt we keep asking for an unpublished event before giving up. */
 const GIVE_UP_MS = 10 * 60_000;
 /** Binance limits /fapi/v1/fundingRate to 500 requests per 5 minutes per IP; we stay under it. */
 const GUARD_CALLS = 400;
@@ -14,6 +15,8 @@ const BEFORE_MS = 1000;
 const AFTER_MS = 60_000;
 /** primeFromInterval never queues more than this many past times for one symbol. */
 const MAX_PRIME = 100;
+/** Most tracked times / cached events kept per symbol. */
+const MAX_PER_SYMBOL = 1000;
 
 export interface FundingTrackerOptions {
   client: ExchangeClient;
@@ -28,12 +31,24 @@ export interface DueFunding {
   event: FundingEvent;
 }
 
+interface SymbolState {
+  /** Known funding times. */
+  times: Set<number>;
+  /** Events fetched or found in the repo, by tracked funding time. No "applied" meaning. */
+  events: Map<number, FundingEvent>;
+  /** Lowest appliedThrough any caller has passed; older entries are pruned. */
+  minApplied: number;
+  /** When we last tried to fetch for this symbol (for fair ordering under the guard). */
+  lastAttempt: number;
+}
+
 export class FundingTracker {
-  /** Funding times not yet fetched, per symbol. Passed times stay until fetched or given up on. */
-  private readonly pending = new Map<string, Set<number>>();
-  /** `${symbol}|${time}` of every event already returned or found in the repo. */
-  private readonly done = new Set<string>();
-  private readonly inflight = new Set<string>();
+  private readonly symbols = new Map<string, SymbolState>();
+  /** First fetch attempt per `${symbol}|${time}`. */
+  private readonly firstAttempt = new Map<string, number>();
+  /** `${symbol}|${time}` given up on (funding_missing logged); never tracked again. */
+  private readonly gaveUp = new Set<string>();
+  private readonly inflight = new Map<string, Promise<FundingEvent | undefined>>();
   /** Times of recent fundingHistory calls. */
   private readonly callTimes: number[] = [];
   private readonly log: (event: string, data: Record<string, unknown>) => void;
@@ -62,60 +77,119 @@ export class FundingTracker {
     for (const t of times.slice(-MAX_PRIME)) this.track(symbol, t);
   }
 
-  /** Settled events for the given symbols whose funding time has passed. Each event is returned once. */
-  async due(symbols: string[], now: number): Promise<DueFunding[]> {
-    const out: DueFunding[] = [];
+  /**
+   * Every settled event with `time > appliedThrough(symbol)` whose funding time has passed, oldest first, for the
+   * given symbols. Taken from the repo when stored there, else fetched once (within the call guard) and stored.
+   * Nothing is marked applied here: the same arguments return the same events again.
+   */
+  async due(symbols: string[], now: number, appliedThrough: (symbol: string) => number): Promise<DueFunding[]> {
+    const work: { symbol: string; st: SymbolState; applied: number }[] = [];
     for (const symbol of symbols) {
-      const times = this.pending.get(symbol);
-      if (!times) continue;
-      for (const t of [...times].sort((a, b) => a - b)) {
+      const st = this.symbols.get(symbol);
+      if (!st) continue;
+      const applied = appliedThrough(symbol);
+      if (applied < st.minApplied) st.minApplied = applied;
+      this.prune(st);
+      work.push({ symbol, st, applied });
+    }
+    // Least recently attempted first, so retries of an unpublished event cannot starve other symbols.
+    const oldestUnresolved = (w: (typeof work)[number]): number =>
+      Math.min(...[...w.st.times].filter((t) => t <= now && t > w.applied && !w.st.events.has(t)), Infinity);
+    work.sort((a, b) => a.st.lastAttempt - b.st.lastAttempt || oldestUnresolved(a) - oldestUnresolved(b));
+
+    const out: DueFunding[] = [];
+    let guardFull = false;
+    for (const { symbol, st, applied } of work) {
+      for (const t of [...st.times].sort((a, b) => a - b)) {
         if (t > now) break;
-        const key = `${symbol}|${t}`;
-        if (this.inflight.has(key)) continue;
-        // Already stored (e.g. before a restart): the consumer has applied it.
-        if (this.o.repo.range(symbol, t - BEFORE_MS, t + AFTER_MS).length > 0) {
-          this.finish(symbol, t);
-          continue;
+        if (t <= applied) continue;
+        let event = st.events.get(t);
+        if (!event && !guardFull) {
+          const key = `${symbol}|${t}`;
+          const first = this.firstAttempt.get(key);
+          if (first !== undefined && now - first > GIVE_UP_MS) {
+            this.giveUp(symbol, st, t);
+            continue;
+          }
+          event = await this.resolve(symbol, st, t, now, () => {
+            guardFull = true;
+          });
         }
-        if (now - t > GIVE_UP_MS) {
-          times.delete(t);
-          this.log('funding_missing', { symbol, time: t });
-          continue;
-        }
-        if (!this.takeCall(now)) return out; // guard full: defer the rest to a later call
-        this.inflight.add(key);
-        try {
-          const events = await this.o.client.fundingHistory(symbol, t - BEFORE_MS, t + AFTER_MS);
-          const event = events.find((e) => !this.done.has(`${symbol}|${e.time}`));
-          if (!event) continue;
-          this.o.repo.upsert(symbol, [event]);
-          this.finish(symbol, t);
-          this.done.add(`${symbol}|${event.time}`);
-          out.push({ symbol, event });
-        } catch (err) {
-          this.log('funding_fetch_failed', { symbol, time: t, error: err instanceof Error ? err.message : String(err) });
-        } finally {
-          this.inflight.delete(key);
-        }
+        if (event && event.time > applied) out.push({ symbol, event });
       }
     }
-    return out;
+    return out.sort((a, b) => a.event.time - b.event.time);
   }
 
   range(symbol: string, fromMs: number, toMs: number): FundingEvent[] {
     return this.o.repo.range(symbol, fromMs, toMs);
   }
 
-  private track(symbol: string, t: number): void {
-    if (this.done.has(`${symbol}|${t}`)) return;
-    let set = this.pending.get(symbol);
-    if (!set) this.pending.set(symbol, (set = new Set()));
-    set.add(t);
+  private resolve(symbol: string, st: SymbolState, t: number, now: number, onGuardFull: () => void): Promise<FundingEvent | undefined> {
+    const key = `${symbol}|${t}`;
+    const running = this.inflight.get(key);
+    if (running) return running;
+    const p = this.lookup(symbol, st, t, now, onGuardFull).finally(() => this.inflight.delete(key));
+    this.inflight.set(key, p);
+    return p;
   }
 
-  private finish(symbol: string, t: number): void {
-    this.pending.get(symbol)?.delete(t);
-    this.done.add(`${symbol}|${t}`);
+  private async lookup(symbol: string, st: SymbolState, t: number, now: number, onGuardFull: () => void): Promise<FundingEvent | undefined> {
+    // Stored by the history loader, catch-up or an earlier run: use it without REST.
+    const stored = this.o.repo.range(symbol, t - BEFORE_MS, t + AFTER_MS)[0];
+    if (stored) {
+      st.events.set(t, stored);
+      return stored;
+    }
+    if (!this.takeCall(now)) {
+      onGuardFull();
+      return undefined;
+    }
+    const key = `${symbol}|${t}`;
+    if (!this.firstAttempt.has(key)) this.firstAttempt.set(key, now);
+    st.lastAttempt = now;
+    try {
+      const event = (await this.o.client.fundingHistory(symbol, t - BEFORE_MS, t + AFTER_MS))[0];
+      if (!event) return undefined;
+      this.o.repo.upsert(symbol, [event]);
+      st.events.set(t, event);
+      this.firstAttempt.delete(key);
+      return event;
+    } catch (err) {
+      this.log('funding_fetch_failed', { symbol, time: t, error: err instanceof Error ? err.message : String(err) });
+      return undefined;
+    }
+  }
+
+  private giveUp(symbol: string, st: SymbolState, t: number): void {
+    const key = `${symbol}|${t}`;
+    this.gaveUp.add(key);
+    this.firstAttempt.delete(key);
+    st.times.delete(t);
+    this.log('funding_missing', { symbol, time: t });
+  }
+
+  private track(symbol: string, t: number): void {
+    if (this.gaveUp.has(`${symbol}|${t}`)) return;
+    let st = this.symbols.get(symbol);
+    if (!st) this.symbols.set(symbol, (st = { times: new Set(), events: new Map(), minApplied: Infinity, lastAttempt: -Infinity }));
+    st.times.add(t);
+  }
+
+  /** Drops times and events nobody can ask for any more, and caps the per-symbol size. */
+  private prune(st: SymbolState): void {
+    for (const t of st.times) {
+      if (t <= st.minApplied) {
+        st.times.delete(t);
+        st.events.delete(t);
+      }
+    }
+    if (st.times.size > MAX_PER_SYMBOL) {
+      for (const t of [...st.times].sort((a, b) => a - b).slice(0, st.times.size - MAX_PER_SYMBOL)) {
+        st.times.delete(t);
+        st.events.delete(t);
+      }
+    }
   }
 
   /** Reserves one fundingHistory call in the rolling window; false when the window is full. */
