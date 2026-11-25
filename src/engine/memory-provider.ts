@@ -16,10 +16,10 @@ export function pineTimeframe(tf: Timeframe): string {
   return tf === '1d' ? 'D' : String(tfToMs(tf) / MIN);
 }
 
-type Period = { kind: 'ms'; ms: number } | { kind: 'week' } | { kind: 'month' };
+export type Period = { kind: 'ms'; ms: number } | { kind: 'week' } | { kind: 'month' };
 
 /** A TradingView timeframe string ("240", "4H", "D", "1D", "W", "M", "3D", ...) as a bucketing rule. */
-function periodOf(timeframe: string): Period | null {
+export function periodOf(timeframe: string): Period | null {
   const m = /^(\d*)([SHDWM]?)$/.exec(String(timeframe).toUpperCase());
   if (!m) return null;
   const n = m[1] === '' ? 1 : Number(m[1]);
@@ -43,7 +43,7 @@ function periodOf(timeframe: string): Period | null {
 }
 
 /** Open time of the bucket holding `t` (UTC; weeks start Monday 00:00 as on Binance and TradingView). */
-function bucketOpen(t: number, p: Period): number {
+export function bucketOpen(t: number, p: Period): number {
   if (p.kind === 'ms') return Math.floor(t / p.ms) * p.ms;
   if (p.kind === 'week') {
     const monday = 4 * DAY; // 1970-01-05 was a Monday
@@ -53,7 +53,7 @@ function bucketOpen(t: number, p: Period): number {
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
 }
 
-function bucketClose(open: number, p: Period): number {
+export function bucketClose(open: number, p: Period): number {
   if (p.kind === 'ms') return open + p.ms;
   if (p.kind === 'week') return open + 7 * DAY;
   const d = new Date(open);

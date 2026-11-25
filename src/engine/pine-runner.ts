@@ -130,7 +130,7 @@ export function toPineOrderCall(method: OrderMethod, args: Record<string, unknow
   return call;
 }
 
-function toBrokerView(v: ScriptView): BrokerView {
+export function toBrokerView(v: ScriptView): BrokerView {
   return {
     position_size: v.positionSize,
     position_avg_price: v.positionAvgPrice,
@@ -211,7 +211,7 @@ export async function runStrategy(o: RunOptions): Promise<void> {
 // ------------------------------------------------------------------ validation ----
 
 /** The source with comments (and, unless `keepStrings`, string literals) blanked out, line by line (positions kept). */
-function codeLines(source: string, keepStrings = false): string[] {
+export function codeLines(source: string, keepStrings = false): string[] {
   const out: string[] = [];
   for (const line of source.split(/\r?\n/)) {
     let s = '';
@@ -292,10 +292,10 @@ function syntheticCandles(n: number, tf: Timeframe): Candle[] {
 
 const VALIDATION_BARS = 300;
 
-type SecurityCall = { line: number; text: string };
+export type SecurityCall = { line: number; text: string };
 
 /** The text of the call starting at line `i`, column `start`, up to its closing paren (it may span lines). */
-function callTextAt(lines: string[], i: number, start: number): string {
+export function callTextAt(lines: string[], i: number, start: number): string {
   let depth = 0;
   let text = '';
   let quote: string | null = null;
@@ -317,7 +317,7 @@ function callTextAt(lines: string[], i: number, start: number): string {
 }
 
 /** Every request.security(...) call (comments blanked, strings kept): its first line and its text up to the closing paren. */
-function securityCalls(lines: string[]): SecurityCall[] {
+export function securityCalls(lines: string[]): SecurityCall[] {
   const calls: SecurityCall[] = [];
   lines.forEach((l, i) => {
     for (const m of l.matchAll(/(?<![\w.])request\.security\s*\(/g)) calls.push({ line: i + 1, text: callTextAt(lines, i, m.index) });
@@ -330,7 +330,7 @@ const stringLiteral = (s: string) => /^\s*(["'])(.*)\1\s*$/s.exec(s)?.[2];
 const plainLiteral = (s: string) => /^\s*(?:"([^"\\]*)"|'([^'\\]*)')\s*$/.exec(s)?.slice(1).find((x) => x !== undefined);
 
 /** A call argument: by name if passed as `name = ...`, else the positional one at `index`. */
-function callArg(args: string[], name: string, index: number): string | undefined {
+export function callArg(args: string[], name: string, index: number): string | undefined {
   const named = (a: string) => /^\s*([A-Za-z_]\w*)\s*=(?!=)([\s\S]*)$/.exec(a);
   for (const a of args) {
     const m = named(a);
@@ -386,7 +386,7 @@ function securityTimeframesOf(calls: SecurityCall[], lines: string[], tf: Timefr
 }
 
 /** A call's arguments as written, split at top-level commas. */
-function callArgs(text: string): string[] {
+export function callArgs(text: string): string[] {
   const inner = text.slice(text.indexOf('(') + 1);
   const args: string[] = [];
   let depth = 0;

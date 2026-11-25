@@ -1,5 +1,6 @@
 import type { DatabaseSync, StatementSync } from 'node:sqlite';
 import type { Candle, FundingEvent, Timeframe } from '../core/types.js';
+import { inTransaction } from './db.js';
 
 interface CandleRow {
   open_time: number;
@@ -19,18 +20,6 @@ const toCandle = (r: CandleRow): Candle => ({
   volume: r.volume,
 });
 
-function inTransaction(db: DatabaseSync, fn: () => void): void {
-  // SAVEPOINT nests safely inside a caller's transaction (and starts one when there is none).
-  db.exec('SAVEPOINT pineapple_repo');
-  try {
-    fn();
-    db.exec('RELEASE pineapple_repo');
-  } catch (e) {
-    db.exec('ROLLBACK TO pineapple_repo');
-    db.exec('RELEASE pineapple_repo');
-    throw e;
-  }
-}
 
 export class CandleRepo {
   private readonly stmts: Record<'upsert' | 'range' | 'latest' | 'count' | 'prune', StatementSync>;

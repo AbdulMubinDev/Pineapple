@@ -6,7 +6,7 @@ import { build } from 'esbuild';
 export async function residentBundle(): Promise<string> {
   const out = await build({
     stdin: {
-      contents: "export { FeedStore, SharedScript, ResidentInstance } from './resident.ts';",
+      contents: "export { FeedStore, SharedScript, ResidentInstance } from '../src/engine/resident.ts';",
       resolveDir: new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'),
       loader: 'ts',
     },
