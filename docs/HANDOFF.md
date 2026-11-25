@@ -26,6 +26,14 @@ This is where v1 stands and how to continue it. Read this first.
   4. The Plan 2 final whole-branch review.
 - **Plan 3** (login, wizard, dashboard, isolate sandbox, Docker, deploy) is not planned yet. Write it from the spec, the design and the carry notes.
 
+## Quality bar (owner requirement, not optional)
+This software computes money: fills, fees, funding, margin, liquidation and P&L. The owner has said explicitly, more than once, that quality must not be traded for speed or cost.
+- **Every task gets the full process.** That means TDD, a separate independent review, fix rounds until there is no open Critical or Important finding, and a scoped re-review after every fix.
+- **Every plan ends with a final whole-branch review on the most capable model.**
+- **Money maths is hand-checked by reviewers.** Acceptance tests (TradingView parity, costs exact to the cent, restart with no lost or duplicated trades) are never loosened without the owner's approval.
+- **Never skip a review, merge a fix without its re-review, or relax a tolerance to make a test pass.**
+- **Say plainly what is unverified.**
+
 ## How work is done here
 - **Process:** one task at a time. A builder implements each task with TDD, a separate reviewer checks it, and fix rounds follow, each with a scoped re-review. A final whole-branch review closes each plan. The owner wants this full quality bar, with no shortcuts.
 - **Commands:**
