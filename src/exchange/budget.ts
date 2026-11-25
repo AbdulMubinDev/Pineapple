@@ -33,6 +33,7 @@ export class RestBudget {
   private bannedUntil = 0;
   /** `seq` is the charge counter at observation time: charges with seq >= it came after the server's reading. */
   private observed: { at: number; used: number; seq: number } | null = null;
+  private peak = 0;
 
   constructor(private readonly o: BudgetOptions) {}
 
@@ -67,9 +68,16 @@ export class RestBudget {
     }
   }
 
+  /** The highest X-MBX-USED-WEIGHT-1M the server has reported (for monitoring). */
+  get peakUsedWeight(): number {
+    return this.peak;
+  }
+
   /** Record the server's X-MBX-USED-WEIGHT-1M. */
   observe(usedWeight1m: number): void {
-    if (Number.isFinite(usedWeight1m) && usedWeight1m >= 0) this.observed = { at: this.o.now(), used: usedWeight1m, seq: this.seq };
+    if (!Number.isFinite(usedWeight1m) || usedWeight1m < 0) return;
+    this.observed = { at: this.o.now(), used: usedWeight1m, seq: this.seq };
+    this.peak = Math.max(this.peak, usedWeight1m);
   }
 
   /** HTTP 429: pause all acquires for `ms`. */

@@ -68,6 +68,11 @@ export interface LiveFeedOptions {
    * when the stream missed them. Default: the last boundary at or before `now()` at construction.
    */
   lastCloseTime?: number;
+  /**
+   * Subscribe to the all-market ticker and mark-price streams too (default true). A manager running feeds for several
+   * timeframes sets false and shares one price stream (src/scanner/price-feed.ts): onPrice / onMark then never fire.
+   */
+  prices?: boolean;
 }
 
 export interface LiveFeedStatus {
@@ -335,7 +340,7 @@ export class LiveFeed {
   private streamList(): string[] {
     if (this.symbols.size === 0) return [];
     const klines = [...this.symbols].map((s) => `${s.toLowerCase()}@kline_${this.o.tf}`);
-    return ['!ticker@arr', '!markPrice@arr@1s', ...klines];
+    return this.o.prices === false ? klines : ['!ticker@arr', '!markPrice@arr@1s', ...klines];
   }
 
   private isConnected(): boolean {

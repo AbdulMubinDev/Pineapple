@@ -834,4 +834,21 @@ describe('LiveFeed', () => {
     feed.stop();
     expect(timers.pending()).toBe(0);
   });
+  it('prices: false subscribes kline streams only (a shared price stream serves several feeds)', async () => {
+    const clock = makeClock(START);
+    const timers = makeTimers(clock);
+    const client = new FakeExchange({ now: clock.now, sleep: clock.sleep });
+    const repo = new CandleRepo(openDb(':memory:'));
+    const feed = new LiveFeed({ client, repo, tf: TF, symbols: SYMS, now: clock.now, setTimer: timers.setTimer, clearTimer: timers.clearTimer, prices: false });
+    const prices: string[] = [];
+    feed.onPrice((s) => prices.push(s));
+    feed.start();
+    await flush();
+    const streams = client.connections.flatMap((c) => c.streams);
+    expect(streams).toEqual(SYMS.map((s) => `${s.toLowerCase()}@kline_${TF}`));
+    client.pushTickers([{ symbol: 'BTCUSDT', last: 1 }]);
+    expect(prices).toEqual([]);
+    expect(feed.status().connected).toBe(true);
+    feed.stop();
+  });
 });

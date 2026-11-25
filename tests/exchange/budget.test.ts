@@ -24,6 +24,16 @@ describe('RestBudget', () => {
     expect(clock.sleeps.length).toBeGreaterThan(0); // it really did have to wait
   });
 
+  it('peakUsedWeight is the highest server-reported usage', () => {
+    const { budget } = mkBudget();
+    expect(budget.peakUsedWeight).toBe(0);
+    budget.observe(300);
+    budget.observe(910);
+    budget.observe(40);
+    budget.observe(Number.NaN);
+    expect(budget.peakUsedWeight).toBe(910);
+  });
+
   it('waits for server-reported usage (X-MBX-USED-WEIGHT-1M)', async () => {
     const { clock, budget } = mkBudget();
     budget.observe(1195);

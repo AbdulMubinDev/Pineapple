@@ -80,6 +80,11 @@ export class FakeExchange implements ExchangeClient {
     this.funding.set(symbol, [...events].sort((a, b) => a.time - b.time));
   }
 
+  /** Replace what pairs() returns (a listing or a delisting). */
+  setPairs(pairs: PairInfo[]): void {
+    this.o.pairs = pairs;
+  }
+
   /** Queue replies for the next requests, e.g. `script({ status: 429, retryAfter: 5 })`. */
   script(...responses: ScriptedResponse[]): void {
     this.scripted.push(...responses);

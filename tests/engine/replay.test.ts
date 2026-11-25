@@ -1,8 +1,11 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import type { Candle, FundingEvent, PairRules } from '../../src/core/types.js';
+import type { Candle, FundingEvent, OrderIntent, PairRules } from '../../src/core/types.js';
 import { DataGapError, loadCandles } from '../../src/data/csv.js';
-import { replay, splitOverfills } from '../../src/engine/replay.js';
+import { PaperBroker } from '../../src/broker/broker.js';
+import { DEFAULT_FEES } from '../../src/broker/costs.js';
+import { barHooks, replay, splitOverfills } from '../../src/engine/replay.js';
+import { StrategyLayer } from '../../src/engine/strategy-layer.js';
 import { tradesCsv } from '../../src/report/summary.js';
 
 const H4 = 14_400_000;
@@ -219,5 +222,41 @@ describe('replay wiring (synthetic bars)', () => {
     expect(t.exitTime).toBe(candles[43]!.openTime);
     expect(t.funding).toBeCloseTo(-0.1, 10); // long pays 1 x 100 (bar 42's open) x 0.001
     expect(r.openPosition).toBeNull();
+  });
+});
+
+describe('barHooks (live wiring)', () => {
+  const decl = { title: 't', pyramiding: 1, closeEntriesRule: 'FIFO' as const, defaultQtyType: 'fixed' as const, defaultQtyValue: 1, overridden: {} };
+  const bar = (i: number): Candle => ({ openTime: i * H4, open: 100, high: 101, low: 99, close: 100, volume: 1 });
+  const wire = (admit?: (i: OrderIntent) => boolean) => {
+    const sizing = { kind: 'script' as const };
+    const broker = new PaperBroker({ startingBalance: 10_000, fees: DEFAULT_FEES, mode: 'binance', rules: () => rules, sizing });
+    const layer = new StrategyLayer(decl, broker, 'BTCUSDT', sizing, { rules, from: H4 });
+    const funding: FundingEvent[] = [];
+    const hooks = barHooks({
+      broker, layer, symbol: 'BTCUSDT', tf: '4h', mode: 'binance', from: H4, funding, processOrdersOnClose: false, warmupEquity: 10_000,
+      ...(admit ? { admit } : {}),
+    });
+    return { broker, hooks, funding };
+  };
+  const entry = [{ kind: 'entry' as const, id: 'L', direction: 'long' as const, qty: 1 }];
+
+  it('applies a funding event pushed into its array after construction (the live scanner adds them per pass)', () => {
+    const { broker, hooks, funding } = wire();
+    hooks.before(bar(1), 1);
+    hooks.after(bar(1), 1, entry);
+    hooks.before(bar(2), 2); // the entry fills at bar 2's open
+    hooks.after(bar(2), 2, []);
+    expect(broker.position('BTCUSDT')?.qty).toBe(1);
+    funding.push({ time: 3 * H4 + 1_000, rate: 0.001, markPrice: 100 });
+    hooks.before(bar(3), 3);
+    expect(broker.account().fundingNet).toBeCloseTo(-0.1, 10);
+  });
+
+  it('admit false drops the intent unsent', () => {
+    const { broker, hooks } = wire((i) => i.tag !== 'entry');
+    hooks.before(bar(1), 1);
+    hooks.after(bar(1), 1, entry);
+    expect(broker.openOrders()).toEqual([]);
   });
 });
