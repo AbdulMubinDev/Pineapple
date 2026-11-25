@@ -85,8 +85,8 @@ const count = (table: string) => (db.prepare(`SELECT COUNT(*) AS n FROM ${table}
 
 describe('RunRepo: runs and settings', () => {
   it('migrates to a new schema version without touching the candle tables', () => {
-    expect((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(3);
-    for (const t of ['candles', 'funding', 'runs', 'settings_history', 'run_state', 'processed_candles', 'trades', 'equity', 'run_log', 'funding_applied']) {
+    expect((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(4);
+    for (const t of ['candles', 'funding', 'runs', 'settings_history', 'run_state', 'processed_candles', 'trades', 'equity', 'run_log', 'funding_applied', 'manager_lease']) {
       expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(t), t).toBeDefined();
     }
   });

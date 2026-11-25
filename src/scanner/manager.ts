@@ -9,6 +9,7 @@ import type { ExchangeClient, PairInfo } from '../exchange/client.js';
 import { FundingTracker } from '../exchange/funding.js';
 import { LiveFeed, type CloseInfo } from '../exchange/live-feed.js';
 import { CandleRepo, FundingRepo } from '../store/candles.js';
+import { LEASE_HEARTBEAT_MS, ManagerLease } from '../store/lease.js';
 import { RunRepo, type RunSetup } from '../store/runs.js';
 import { PriceFeed } from './price-feed.js';
 import { ScannerRun, type PassReport, type ScannerStatus } from './run.js';
@@ -65,9 +66,12 @@ export class RunManager {
   private universe: { pairs: PairInfo[]; volumes: Map<string, number>; at: number } | null = null;
   private readonly primed = new Set<string>();
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
   private refreshing: Promise<void> = Promise.resolve();
+  private readonly lease: ManagerLease;
 
   constructor(private readonly o: RunManagerOptions) {
+    this.lease = new ManagerLease(o.db, o.now);
     this.repo = new RunRepo(o.db, o.now);
     this.candles = new CandleRepo(o.db);
     this.fundingRepo = new FundingRepo(o.db);
@@ -89,14 +93,18 @@ export class RunManager {
 
   /**
    * Creates and starts a run: universe, warm-up, then the shared live feed. `onCreated` gets the id before the
-   * warm-up (which takes minutes on the full universe). Throws `run limit reached (N)` past the limit.
+   * warm-up (which takes minutes on the full universe). The first start takes the database's manager lease (one
+   * scanner process per database: `another scanner process holds this database`). Throws `run limit reached (N)`
+   * when the database already has RUN_LIMIT running or paused runs.
    */
   async start(o: { name: string; setup: RunSetup }, onCreated?: (runId: number) => void): Promise<number> {
-    const limit = runLimit(this.o.memLimitMb);
-    if (this.liveRuns().length >= limit) throw new Error(`run limit reached (${limit})`);
     if (!isTimeframe(o.setup.tf)) throw new Error(`unsupported timeframe ${String(o.setup.tf)}`);
+    this.takeLease();
+    const limit = runLimit(this.o.memLimitMb);
+    const full = () => this.repo.activeRuns() >= limit;
+    if (full()) throw new Error(`run limit reached (${limit})`);
     const universe = await this.loadUniverse();
-    if (this.liveRuns().length >= limit) throw new Error(`run limit reached (${limit})`);
+    if (full()) throw new Error(`run limit reached (${limit})`);
     const runId = this.repo.createRun(o);
     const run = new ScannerRun({
       runId,
@@ -111,6 +119,7 @@ export class RunManager {
       ...(this.o.htfBars === undefined ? {} : { htfBars: this.o.htfBars }),
       ...(this.o.concurrency === undefined ? {} : { concurrency: this.o.concurrency }),
       onEvent: (m) => this.event(runId, m),
+      onSymbolsChanged: () => this.updateFeedSymbols(o.setup.tf),
     });
     this.runs.set(runId, run);
     onCreated?.(runId);
@@ -250,9 +259,10 @@ export class RunManager {
     return run;
   }
 
-  pause(runId: number): void {
-    this.live(runId).pause();
+  async pause(runId: number): Promise<void> {
+    const run = this.live(runId);
     this.repo.setStatus(runId, 'paused');
+    await run.pause();
   }
 
   resume(runId: number): void {
@@ -294,16 +304,47 @@ export class RunManager {
     }
   }
 
-  /** Applies pause / resume / stop that another process (the CLI) wrote to the runs table. */
-  syncFromDb(): void {
+  /** Applies pause / resume / stop that another process (the CLI) wrote to the runs table. Runs on every heartbeat. */
+  syncFromDb(): Promise<void> {
+    const pauses: Promise<void>[] = [];
     for (const id of this.liveRuns()) {
       const status = this.repo.getRun(id)?.status;
       const run = this.runs.get(id)!;
       if (status === 'stopped') this.stop(id);
-      else if (status === 'paused' && !run.isPaused) run.pause();
+      else if (status === 'paused' && !run.isPaused) pauses.push(run.pause());
       else if (status === 'running' && run.isPaused) run.resume();
     }
+    return Promise.all(pauses).then(() => undefined);
   }
+
+  // ------------------------------------------------------------------ lease ----
+
+  private takeLease(): void {
+    this.lease.acquire();
+    if (this.heartbeatTimer === null) this.armHeartbeat();
+  }
+
+  /**
+   * Every LEASE_HEARTBEAT_MS: renew the lease, apply run control written by other processes, and prefetch the funding
+   * the runs will need (in the background, through the budget). Losing the lease stops everything here.
+   */
+  private armHeartbeat(): void {
+    this.heartbeatTimer = this.o.setTimer(() => {
+      this.heartbeatTimer = null;
+      if (!this.lease.renew()) {
+        this.event(null, 'lost the database lease to another scanner process: stopping feeds');
+        this.shutdown();
+        return;
+      }
+      void this.syncFromDb().catch((e: unknown) => this.event(null, `control sync failed: ${message(e)}`));
+      for (const id of this.liveRuns()) this.runs.get(id)!.prefetchFunding();
+      this.onHeartbeat?.();
+      this.armHeartbeat();
+    }, LEASE_HEARTBEAT_MS);
+  }
+
+  /** Called after each heartbeat (the CLI exits once no run is left). */
+  onHeartbeat: (() => void) | null = null;
 
   status(runId: number): ScannerStatus {
     const run = this.runs.get(runId);
@@ -318,11 +359,17 @@ export class RunManager {
     for (const r of this.runs.values()) await r.idle();
   }
 
-  /** Stops the feeds and timers (the runs keep their status: a restart resumes them). */
+  /**
+   * Stops the feeds and timers and releases the database lease. The runs keep their status as it is (running or
+   * paused); Task 8's restart recovery resumes them on the next start.
+   */
   shutdown(): void {
     for (const e of this.feeds.values()) e.feed.stop();
     this.feeds.clear();
     this.stopShared();
+    if (this.heartbeatTimer !== null) (this.o.clearTimer ?? clearTimeout)(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+    this.lease.release();
   }
 
   private stopShared(): void {

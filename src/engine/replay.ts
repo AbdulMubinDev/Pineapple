@@ -121,8 +121,11 @@ export interface BarHooksOptions {
   /** The equity a warm-up bar's flat view reports. */
   warmupEquity: number;
   onRejected?: (r: ReplayRejection) => void;
-  /** Asked before each submit: false drops the intent unsent (a paused live run drops entries). Default: all sent. */
-  admit?: (intent: OrderIntent, now: number) => boolean;
+  /**
+   * Asked before each submit: returns the intent to send (possibly reduced: a paused live run keeps a reversal's
+   * closing part), or null to drop it unsent. Default: every intent as it is.
+   */
+  admit?: (intent: OrderIntent, now: number) => OrderIntent | null;
   /** After a replayed bar's last fill. */
   onBarDone?: (bar: Candle) => void;
 }
@@ -133,8 +136,9 @@ export function barHooks(o: BarHooksOptions): BarHooks {
   const tfMs = tfToMs(o.tf);
   let fi = 0;
   const submit = (intents: OrderIntent[], now: number) => {
-    for (const i of intents) {
-      if (o.admit && !o.admit(i, now)) continue;
+    for (const intent of intents) {
+      const i = o.admit ? o.admit(intent, now) : intent;
+      if (!i) continue;
       const r = broker.submit(i, now);
       if (!r.accepted) o.onRejected?.({ stage: 'submit', orderId: i.id, time: now, reason: r.reason });
     }

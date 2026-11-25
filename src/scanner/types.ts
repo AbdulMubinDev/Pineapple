@@ -19,8 +19,15 @@ export interface PassReport {
   /** Pairs not stepped, by reason: processed, missing_bar, behind, error, insufficient_history, warmup_failed, loading. */
   skipped: Record<string, string[]>;
   durationMs: number;
+  /** From the candle close to the pass's commit (the 10 s pass deadline is measured on it). */
+  latencyMs: number;
+  /** The commit was rejected (duplicate or stale pass): the run reloaded its saved state instead. */
+  rejected: boolean;
   errors: { symbol: string; message: string }[];
 }
+
+/** A pass must be committed this long after its candle close at the latest (Global Constraints). */
+export const PASS_DEADLINE_MS = 10_000;
 
 export interface ScannerStatus {
   universe: number;
@@ -43,6 +50,8 @@ export interface Pair {
   /** The last bar stepped (or warmed on) and its index. */
   last: Candle;
   idx: number;
+  /** The last bar of the newest warm-up history: a reload with nothing processed yet rolls back to it. */
+  warmEnd: number;
   state: 'ok' | 'error';
   /** Funding applied (stepped through, or applied late) through this time. */
   fundingThrough: number;

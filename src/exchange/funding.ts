@@ -83,8 +83,10 @@ export class FundingTracker {
    * Every settled event with `time > appliedThrough(symbol)` whose funding time has passed, oldest first, for the
    * given symbols. Taken from the repo when stored there, else fetched once (within the call guard) and stored.
    * Nothing is marked applied here: the same arguments return the same events again.
+   * `fetch: false` reads the repo only (no REST, no give-up bookkeeping): a pass uses it after a background prefetch.
    */
-  async due(symbols: string[], now: number, appliedThrough: (symbol: string) => number): Promise<DueFunding[]> {
+  async due(symbols: string[], now: number, appliedThrough: (symbol: string) => number, opts: { fetch?: boolean } = {}): Promise<DueFunding[]> {
+    const fetch = opts.fetch !== false;
     this.pruneAttempts(now);
     const work: { symbol: string; st: SymbolState; applied: number }[] = [];
     for (const symbol of symbols) {
@@ -106,7 +108,9 @@ export class FundingTracker {
         if (t > now) break;
         if (t <= applied) continue;
         let event = st.events.get(t);
-        if (!event) {
+        if (!event && !fetch) {
+          event = this.stored(symbol, st, t);
+        } else if (!event) {
           const key = `${symbol}|${t}`;
           const first = this.firstAttempt.get(key);
           if (first !== undefined && now - first > GIVE_UP_MS) {
@@ -135,13 +139,24 @@ export class FundingTracker {
     return p;
   }
 
+  /** Funding times tracked for `symbol` in (after, upTo], oldest first (whether resolved or not). */
+  passedTimes(symbol: string, after: number, upTo: number): number[] {
+    const st = this.symbols.get(symbol);
+    if (!st) return [];
+    return [...st.times].filter((t) => t > after && t <= upTo).sort((a, b) => a - b);
+  }
+
+  /** The event for tracked time `t` if the repo holds it. */
+  private stored(symbol: string, st: SymbolState, t: number): FundingEvent | undefined {
+    const ev = this.o.repo.range(symbol, t - BEFORE_MS, t + AFTER_MS)[0];
+    if (ev) st.events.set(t, ev);
+    return ev;
+  }
+
   private async lookup(symbol: string, st: SymbolState, t: number, now: number): Promise<FundingEvent | undefined> {
     // Stored by the history loader, catch-up or an earlier run: use it without REST.
-    const stored = this.o.repo.range(symbol, t - BEFORE_MS, t + AFTER_MS)[0];
-    if (stored) {
-      st.events.set(t, stored);
-      return stored;
-    }
+    const stored = this.stored(symbol, st, t);
+    if (stored) return stored;
     if (!this.takeCall(now)) return undefined;
     const key = `${symbol}|${t}`;
     if (!this.firstAttempt.has(key)) this.firstAttempt.set(key, now);

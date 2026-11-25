@@ -168,11 +168,14 @@ export class PaperBroker {
     this.orders = this.orders.filter((x) => x.id !== orderId);
   }
 
-  /** A new bar opened: pending market orders fill at bar.open plus slippage. */
+  /**
+   * A new bar opened: pending market orders fill at bar.open plus slippage. An order submitted after the bar
+   * opened (live, mid-bar) is not filled at that open: it fills at a later tick or the next bar's open.
+   */
   onBarOpen(symbol: string, bar: Candle): Fill[] {
     this.lastPrice[symbol] = bar.open;
     // Funding is not applied here: the replay calls applyFunding explicitly for events in the bar.
-    return this.fillMarketOrders(symbol, bar.open, bar.openTime);
+    return this.fillMarketOrders(symbol, bar.open, bar.openTime, (o) => o.submittedAt <= bar.openTime);
   }
 
   /**
@@ -180,28 +183,38 @@ export class PaperBroker {
    * With `liquidation` (binance mode only), the isolated position's liquidation price is checked on the
    * same path, in order with the orders: whichever the path reaches first acts first, and a tie goes to
    * the order. On a gap past both, the order acts first only if its level lies between the previous price and LP. The bar's prices stand in for the mark price, which the candles do not carry.
+   * Ruling H2: only what was active when the bar opened is walked. An order submitted after bar.openTime, or a
+   * position opened or added to after it (live fills between closes), already saw the live ticks from then on;
+   * the bar's earlier extremes must not act on it. Replay submits and fills at bar boundaries only, so it is unaffected.
    */
   onBarRange(symbol: string, bar: Candle, opts: { liquidation?: boolean } = {}): Fill[] {
     const lowFirst = Math.abs(bar.high - bar.open) >= Math.abs(bar.open - bar.low);
     const path = lowFirst
       ? [bar.open, bar.low, bar.high, bar.close]
       : [bar.open, bar.high, bar.low, bar.close];
-    const fills = this.walkPath(symbol, path, bar.openTime, opts.liquidation === true && this.o.mode === 'binance');
+    const fills = this.walkPath(symbol, path, bar.openTime, opts.liquidation === true && this.o.mode === 'binance', bar.openTime);
     this.lastPrice[symbol] = bar.close;
     return fills;
   }
 
-  /** Fill pending market orders at `price` plus slippage (process_orders_on_close: the bar's close). */
-  fillMarketAt(symbol: string, price: number, time: number): Fill[] {
+  /**
+   * Fill pending market orders at `price` plus slippage (process_orders_on_close: the bar's close). With
+   * `submittedAfter`, only orders submitted after that time (a live tick fills the market intents a live fill made).
+   */
+  fillMarketAt(symbol: string, price: number, time: number, opts: { submittedAfter?: number } = {}): Fill[] {
     this.lastPrice[symbol] = price;
-    return this.fillMarketOrders(symbol, price, time);
+    const after = opts.submittedAfter;
+    return this.fillMarketOrders(symbol, price, time, after === undefined ? undefined : (o) => o.submittedAt > after);
   }
 
-  /** Live tick: market orders fill at price, resting orders trigger on the move from the last price. */
-  onPrice(symbol: string, price: number, time: number): Fill[] {
+  /**
+   * Live tick: market orders fill at price (unless `markets: false`: they wait for the next bar's open), resting
+   * orders trigger on the move from the last price.
+   */
+  onPrice(symbol: string, price: number, time: number, opts: { markets?: boolean } = {}): Fill[] {
     const prev = this.lastPrice[symbol];
     this.lastPrice[symbol] = price;
-    const fills = this.fillMarketOrders(symbol, price, time);
+    const fills = opts.markets === false ? [] : this.fillMarketOrders(symbol, price, time);
     if (prev !== undefined) fills.push(...this.walkPath(symbol, [prev, price], time));
     return fills;
   }
@@ -239,6 +252,18 @@ export class PaperBroker {
     this.fundingNet += change;
     m.funding += change;
     return change;
+  }
+
+  /**
+   * A funding payment for `symbol` booked after the position (or part of it) that held it was closed live, before
+   * the event had settled (binance mode only): balance, funding total and the symbol's realised net move by `amount`.
+   * The closed trade itself is not restated.
+   */
+  adjustFunding(symbol: string, amount: number): void {
+    if (this.o.mode !== 'binance' || !Number.isFinite(amount) || amount === 0) return;
+    this.balance += amount;
+    this.fundingNet += amount;
+    this.realised[symbol] = (this.realised[symbol] ?? 0) + amount;
   }
 
   /** The last price the broker marked `symbol` at (open, path, close or tick), if any. */
@@ -335,6 +360,13 @@ export class PaperBroker {
   }
 
   // ---------------------------------------------------------------- internals
+
+  /** When the open position was opened or last added to (its liquidation price was set then); -Infinity when flat. */
+  private positionChangedAt(symbol: string): number {
+    const pos = this.positions[symbol];
+    if (!pos) return -Infinity;
+    return Math.max(pos.openTime, this.meta[symbol]?.changedAt ?? -Infinity);
+  }
 
   /** The open position's isolated liquidation price, or null when flat. */
   private liquidationLevel(symbol: string): number | null {
@@ -453,9 +485,9 @@ export class PaperBroker {
     return pos !== undefined && (pos.qty > 0) !== (o.side === 'buy');
   }
 
-  private fillMarketOrders(symbol: string, price: number, time: number): Fill[] {
+  private fillMarketOrders(symbol: string, price: number, time: number, eligible?: (o: StoredOrder) => boolean): Fill[] {
     const fills: Fill[] = [];
-    const pending = this.orders.filter((x) => x.symbol === symbol && x.type === 'market');
+    const pending = this.orders.filter((x) => x.symbol === symbol && x.type === 'market' && (!eligible || eligible(x)));
     for (const ord of pending) {
       if (!this.orders.includes(ord)) continue; // cancelled by an OCA sibling
       const f = this.execute(ord, price, time);
@@ -489,7 +521,9 @@ export class PaperBroker {
     return null;
   }
 
-  private walkPath(symbol: string, path: number[], time: number, liquidation = false): Fill[] {
+  /** `activeBy`: only orders submitted, and a position last opened or added to, at or before it act (onBarRange). */
+  private walkPath(symbol: string, path: number[], time: number, liquidation = false, activeBy = Infinity): Fill[] {
+    if (liquidation && this.positionChangedAt(symbol) > activeBy) liquidation = false;
     const fills: Fill[] = [];
     const filledGroups = new Set<string>();
     for (let i = 0; i + 1 < path.length; i++) {
@@ -498,7 +532,7 @@ export class PaperBroker {
       for (;;) {
         let best: { ord: StoredOrder; t: Trigger } | null = null;
         for (const ord of this.orders) {
-          if (ord.symbol !== symbol || ord.type === 'market') continue;
+          if (ord.symbol !== symbol || ord.type === 'market' || ord.submittedAt > activeBy) continue;
           if (!this.canAct(ord)) continue; // exit with nothing to exit stays resting
           if (ord.ocaGroup !== undefined && filledGroups.has(ord.ocaGroup)) continue;
           const t = this.trigger(ord, cursor, target);
@@ -646,6 +680,7 @@ export class PaperBroker {
       pos.margin += margin;
       pos.leverage = ord.leverage;
       m.fees += fee;
+      if (time > pos.openTime) m.changedAt = time;
     } else {
       this.positions[sym] = { symbol: sym, qty: sign * qty, entryPrice: price, leverage: ord.leverage, margin, openTime: time };
       this.meta[sym] = { fees: fee, funding: 0 };

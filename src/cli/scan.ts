@@ -34,7 +34,8 @@ export function formatReport(runId: number, r: PassReport): string {
     .map(([k, v]) => `${k}=${v.length}`)
     .join(' ');
   const errors = r.errors.length > 0 ? ` errors=${r.errors.map((e) => `${e.symbol}: ${e.message}`).join('; ')}` : '';
-  return `[${stamp()}] run ${runId} close ${iso(r.closeTime)} scanned=${r.scanned} ${skipped ? `skipped: ${skipped} ` : ''}durationMs=${r.durationMs}${errors}`;
+  const late = r.latencyMs > PASS_DEADLINE_MS ? ' DEADLINE MISSED' : '';
+  return `[${stamp()}] run ${runId} close ${iso(r.closeTime)} scanned=${r.scanned} ${skipped ? `skipped: ${skipped} ` : ''}durationMs=${r.durationMs} latencyMs=${r.latencyMs}${late}${r.rejected ? ' COMMIT REJECTED (state reloaded)' : ''}${errors}`;
 }
 
 async function start(args: string[]): Promise<void> {
@@ -83,21 +84,15 @@ async function start(args: string[]): Promise<void> {
     `[${stamp()}] run ${id} live: universe=${s.universe} skipped=${JSON.stringify(s.skipped)} warm-up ${((Date.now() - t0) / 1000).toFixed(0)} s, peak used weight ${client.budget.peakUsedWeight}`,
   );
 
-  const sync = setInterval(() => {
-    try {
-      manager.syncFromDb();
-      if (manager.liveRuns().length === 0) {
-        clearInterval(sync);
-        manager.shutdown();
-        console.log(`[${stamp()}] run ${id} stopped; exiting`);
-        db.close();
-      }
-    } catch (e) {
-      console.error(`[${stamp()}] sync failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }, SYNC_MS);
+  // The manager's heartbeat applies pause / resume / stop written by other shells; exit once no run is left.
+  manager.onHeartbeat = () => {
+    if (manager.liveRuns().length > 0) return;
+    manager.shutdown();
+    console.log(`[${stamp()}] run ${id} stopped; exiting`);
+    db.close();
+  };
   process.once('SIGINT', () => {
-    clearInterval(sync);
+    // Releases the lease; the run keeps its status (Task 8 resumes it on the next start).
     manager.shutdown();
     console.log(`[${stamp()}] interrupted; run ${id} keeps status ${manager.repo.getRun(id)?.status}`);
     process.exit(130);

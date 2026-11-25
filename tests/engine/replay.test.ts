@@ -228,7 +228,7 @@ describe('replay wiring (synthetic bars)', () => {
 describe('barHooks (live wiring)', () => {
   const decl = { title: 't', pyramiding: 1, closeEntriesRule: 'FIFO' as const, defaultQtyType: 'fixed' as const, defaultQtyValue: 1, overridden: {} };
   const bar = (i: number): Candle => ({ openTime: i * H4, open: 100, high: 101, low: 99, close: 100, volume: 1 });
-  const wire = (admit?: (i: OrderIntent) => boolean) => {
+  const wire = (admit?: (i: OrderIntent) => OrderIntent | null) => {
     const sizing = { kind: 'script' as const };
     const broker = new PaperBroker({ startingBalance: 10_000, fees: DEFAULT_FEES, mode: 'binance', rules: () => rules, sizing });
     const layer = new StrategyLayer(decl, broker, 'BTCUSDT', sizing, { rules, from: H4 });
@@ -253,8 +253,8 @@ describe('barHooks (live wiring)', () => {
     expect(broker.account().fundingNet).toBeCloseTo(-0.1, 10);
   });
 
-  it('admit false drops the intent unsent', () => {
-    const { broker, hooks } = wire((i) => i.tag !== 'entry');
+  it('admit null drops the intent unsent', () => {
+    const { broker, hooks } = wire((i) => (i.tag === 'entry' ? null : i));
     hooks.before(bar(1), 1);
     hooks.after(bar(1), 1, entry);
     expect(broker.openOrders()).toEqual([]);

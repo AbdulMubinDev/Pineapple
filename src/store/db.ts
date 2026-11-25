@@ -66,6 +66,11 @@ const MIGRATIONS: readonly string[] = [
    ) WITHOUT ROWID;`,
   // 3: the whole run log of a run, in order (logs(runId) without a kind).
   `CREATE INDEX run_log_run_id ON run_log (run_id, id);`,
+  // 4: one scanner process per database (src/store/lease.ts): the holder renews its heartbeat.
+  `CREATE TABLE manager_lease (
+     id INTEGER PRIMARY KEY CHECK (id = 1),
+     token TEXT NOT NULL, pid INTEGER NOT NULL, heartbeat INTEGER NOT NULL
+   );`,
 ];
 
 /**

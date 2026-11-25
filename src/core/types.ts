@@ -128,6 +128,8 @@ export interface StoredOrder extends OrderIntent {
 export interface PositionMeta {
   fees: number;
   funding: number;
+  /** When an add last changed the position after it opened (its liquidation price moved). Absent: never added to. */
+  changedAt?: number;
 }
 
 /** Plain JSON. JSON.parse(JSON.stringify(s)) restores it identically. */

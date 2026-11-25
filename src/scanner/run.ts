@@ -27,8 +27,9 @@ import type { CloseInfo, LiveFeedStatus } from '../exchange/live-feed.js';
 import type { CandleRepo } from '../store/candles.js';
 import type { RunRepo, RunSetup } from '../store/runs.js';
 import { RunLedger } from './ledger.js';
-import { catchUpBars, fundingSteppedThrough, queueFunding, type PairPlan } from './run-pass.js';
-import { BAR_STATE_WARNING, type Pair, type PassReport, type PendingReason, type ScannerStatus } from './types.js';
+import { fundingBeforeLiveFill, pendingAfterLiveFill, settlePending, type PendingFunding } from './run-live.js';
+import { catchUpBars, exposureFloor, fundingSteppedThrough, queueFunding, type PairPlan } from './run-pass.js';
+import { BAR_STATE_WARNING, PASS_DEADLINE_MS, type Pair, type PassReport, type PendingReason, type ScannerStatus } from './types.js';
 import {
   buildHtf,
   contiguousTail,
@@ -59,6 +60,8 @@ export interface ScannerRunOptions {
   concurrency?: number;
   /** Progress lines for an operator (warm-up counts, retries). */
   onEvent?: (message: string) => void;
+  /** The pairs this run wants bars for changed (a delisting, a listing joined): the manager updates its feed. */
+  onSymbolsChanged?: () => void;
 }
 
 const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -93,6 +96,11 @@ export class ScannerRun {
   private lastPassAt = 0;
   private feedStatus: (() => LiveFeedStatus) | null = null;
   private wasBanned = false;
+  /** Symbols with market intents a live fill made, by the open of the bar they were made in (H2: next tick fills them). */
+  private readonly liveMarket = new Map<string, number>();
+  /** Funding held by positions closed live before the event settled (charged once it resolves). */
+  private pendingFunding: PendingFunding[] = [];
+  private prefetching: Promise<void> | null = null;
 
   constructor(o: ScannerRunOptions) {
     this.o = o;
@@ -233,6 +241,7 @@ export class ScannerRun {
         this.ledger.track(symbol, layer);
         this.pairs.set(symbol, p);
         this.pending.delete(symbol);
+        if (this.warmCovers > 0) this.o.onSymbolsChanged?.(); // a listing joined a live run: the feed needs it
         return true;
       });
       if (added) return;
@@ -269,17 +278,23 @@ export class ScannerRun {
       htfKeep: this.bounds!.htfKeep,
     });
     const through = this.o.repo.appliedThrough(this.runId, symbol);
-    return { info, layer, inst, funding, last, idx: h.history.length - 1, state: 'ok', fundingThrough: through, repairing: false };
+    return { info, layer, inst, funding, last, idx: h.history.length - 1, warmEnd: last.openTime, state: 'ok', fundingThrough: through, repairing: false };
   }
 
   private onRejected(symbol: string, r: ReplayRejection): void {
     this.log('rejection', symbol, { stage: r.stage, orderId: r.orderId, reason: r.reason, time: r.time });
   }
 
-  private admit(symbol: string, i: OrderIntent): boolean {
-    if (!this.paused || i.tag !== 'entry' || i.reduceOnly) return true;
-    this.log('paused_entry_dropped', symbol, { orderId: i.id, side: i.side, type: i.type });
-    return false;
+  /**
+   * Paused: an entry is dropped (logged paused_entry_dropped). A reversal keeps its closing part, sent reduce-only
+   * for the position's size; only its opening part is dropped.
+   */
+  private admit(symbol: string, i: OrderIntent): OrderIntent | null {
+    if (!this.paused || i.tag !== 'entry' || i.reduceOnly) return i;
+    const pos = this.broker.position(symbol);
+    const reverses = pos !== null && (pos.qty > 0) !== (i.side === 'buy');
+    this.log('paused_entry_dropped', symbol, { orderId: i.id, side: i.side, type: i.type, ...(reverses ? { kept: 'closing_part' } : {}) });
+    return reverses ? { ...i, qty: Math.abs(pos.qty), reduceOnly: true } : null;
   }
 
   // ------------------------------------------------------------------- pass ----
@@ -290,15 +305,17 @@ export class ScannerRun {
 
   private async pass(closeTime: number, bars: Map<string, Candle>, info: CloseInfo): Promise<PassReport> {
     const t0 = this.o.now();
-    const report: PassReport = { closeTime, scanned: 0, stepped: [], skipped: {}, durationMs: 0, errors: [] };
+    const report: PassReport = { closeTime, scanned: 0, stepped: [], skipped: {}, durationMs: 0, latencyMs: 0, rejected: false, errors: [] };
     const skip = (reason: string, symbol: string) => (report.skipped[reason] ??= []).push(symbol);
     if (this.stopped) return this.finish(report, t0);
     this.checkBanned();
+    this.settlePendingFunding();
     for (const [symbol, p] of this.pending) skip(p.reason, symbol);
     const missing = new Set(info.missing);
     const behind = new Set(info.behind);
 
     const plans: PairPlan[] = [];
+    let ahead = false;
     for (const p of this.byVolume([...this.pairs.values()])) {
       const symbol = p.info.symbol;
       const bar = bars.get(symbol);
@@ -318,15 +335,22 @@ export class ScannerRun {
           this.log('behind', symbol, { closeTime, lastStepped: p.last.openTime });
           this.repair(p);
         } else if (seq.some((c) => this.o.repo.isProcessed(this.runId, symbol, c.openTime))) {
-          // Committed already but not stepped here: memory is behind the database. Warm the pair up again past it.
+          // Committed already but not stepped here: memory and the database disagree. Nothing of this pass is stepped:
+          // the whole run reloads the saved state, and the next close catches every pair up from it.
           skip('processed', symbol);
-          await this.rewarm(p, 'processed_ahead');
+          ahead = true;
         } else plans.push({ p, seq });
       }
     }
+    if (ahead) {
+      this.ledger.log('state_reloaded', undefined, { reason: 'processed_ahead', closeTime });
+      await this.reload();
+      report.rejected = true;
+      return this.finish(report, t0);
+    }
 
     const fundingApplied = await queueFunding(
-      { broker: this.broker, funding: this.o.funding, now: this.o.now(), appliedThrough: (s) => this.o.repo.appliedThrough(this.runId, s), log: (k, s, d) => this.log(k, s, d) },
+      { broker: this.broker, funding: this.o.funding, closeTime, appliedThrough: (s) => this.o.repo.appliedThrough(this.runId, s), log: (k, s, d) => this.log(k, s, d) },
       plans,
     );
     const processed: { symbol: string; openTime: number }[] = [];
@@ -362,27 +386,87 @@ export class ScannerRun {
     report.scanned = report.stepped.length;
     const changed = processed.length > 0 || touched.size > 0 || this.ledger.pendingLogs > 0 || Object.keys(fundingApplied).length > 0;
     if (!this.stopped && changed) {
-      const ok = this.commit(closeTime, processed, touched, fundingApplied, closeTime);
-      if (!ok) await this.reload();
+      const latency = this.o.now() - closeTime;
+      if (latency > PASS_DEADLINE_MS) this.log('warning', undefined, { reason: 'deadline_missed', closeTime, latencyMs: latency });
+      if (!this.commit(closeTime, processed, touched, fundingApplied, closeTime)) {
+        report.rejected = true;
+        await this.reload();
+      }
     }
+    this.prefetchFunding();
     return this.finish(report, t0);
   }
 
   private finish(report: PassReport, t0: number): PassReport {
-    report.durationMs = this.o.now() - t0;
+    const now = this.o.now();
+    report.durationMs = now - t0;
+    report.latencyMs = now - report.closeTime;
     this.lastReport = report;
-    this.lastPassAt = this.o.now();
+    this.lastPassAt = now;
     return report;
+  }
+
+  // ---------------------------------------------------------------- funding ----
+
+  /**
+   * Resolves the funding the next passes and live fills will need, between passes and through the REST budget, so a
+   * pass reads it from the repo: pairs with a position or orders, and funding pending after a live close. One at a time.
+   */
+  prefetchFunding(): void {
+    if (this.stopped || this.prefetching) return;
+    const now = this.o.now();
+    const floors = new Map<string, number>();
+    for (const p of this.pairs.values()) {
+      const s = p.info.symbol;
+      if (this.broker.position(s) === null && this.broker.openOrders(s).length === 0) continue;
+      floors.set(s, exposureFloor(this.broker, s, Math.max(p.fundingThrough, this.o.repo.appliedThrough(this.runId, s)), p.last.openTime + this.tfMs));
+    }
+    for (const x of this.pendingFunding) floors.set(x.symbol, Math.min(floors.get(x.symbol) ?? Infinity, x.time - 1));
+    if (floors.size === 0) return;
+    const task = this.o.funding
+      .due([...floors.keys()], now, (s) => floors.get(s)!)
+      .then(() => undefined)
+      .catch((e: unknown) => this.o.onEvent?.(`funding prefetch failed: ${message(e)}`))
+      .finally(() => {
+        this.prefetching = null;
+        this.background.delete(task);
+      });
+    this.prefetching = task;
+    this.background.add(task);
+  }
+
+  /** Charges pending funding whose event the repo now holds (inside the lock). */
+  private settlePendingFunding(): void {
+    if (this.pendingFunding.length === 0) return;
+    const { remaining, settled } = settlePending(this.broker, this.o.funding, this.pendingFunding);
+    this.pendingFunding = remaining;
+    for (const x of settled) this.log('warning', x.symbol, { reason: 'funding_after_live_close', time: x.time, qty: x.qty, rate: x.rate, amount: x.amount });
   }
 
   // ------------------------------------------------------------- live fills ----
 
-  /** A live last price: resting stop/limit orders of `symbol` may fill now (committed at once). */
+  /**
+   * A live last price (committed at once when anything fills):
+   *  - market intents a live fill made earlier in this bar fill at this tick (H2), not at a bar open;
+   *  - resting stop/limit orders trigger on the move from the last price. Market orders made at a close still wait
+   *    for the next bar's open, as in replay.
+   * Before anything can fill, the open position pays the funding that settled since its last funding (resolved only).
+   */
   onPrice(symbol: string, last: number, time: number): void {
     if (this.stopped || this.busy > 0) return;
     const p = this.pairs.get(symbol);
-    if (!p || !this.broker.openOrders(symbol).some((o) => o.type !== 'market')) return;
-    this.afterLiveFills(p, this.broker.onPrice(symbol, last, time), time);
+    if (!p) return;
+    const since = this.liveMarket.get(symbol);
+    if (since === undefined && !this.broker.openOrders(symbol).some((o) => o.type !== 'market')) return;
+    const before = this.broker.position(symbol);
+    const through = fundingBeforeLiveFill(this.broker, this.o.funding, p, time);
+    const fills: Fill[] = [];
+    if (since !== undefined) {
+      this.liveMarket.delete(symbol);
+      fills.push(...this.broker.fillMarketAt(symbol, last, time, { submittedAfter: since - 1 }));
+    }
+    fills.push(...this.broker.onPrice(symbol, last, time, { markets: false }));
+    this.afterLiveFills(p, fills, time, before, through);
   }
 
   /** A live mark price: liquidation of an open position (committed at once). */
@@ -390,18 +474,30 @@ export class ScannerRun {
     if (this.stopped || this.busy > 0) return;
     const p = this.pairs.get(m.symbol);
     if (!p || this.broker.position(m.symbol) === null) return;
-    this.afterLiveFills(p, this.broker.onMark(m.symbol, m.markPrice, m.time), m.time);
+    const before = this.broker.position(m.symbol);
+    const through = fundingBeforeLiveFill(this.broker, this.o.funding, p, m.time);
+    this.afterLiveFills(p, this.broker.onMark(m.symbol, m.markPrice, m.time), m.time, before, through);
   }
 
-  private afterLiveFills(p: Pair, fills: Fill[], time: number): void {
-    if (fills.length === 0) return;
+  private afterLiveFills(p: Pair, fills: Fill[], time: number, before: ReturnType<PaperBroker['position']>, through: number | null): void {
     const symbol = p.info.symbol;
-    for (const i of p.layer.onFills(fills, this.formingBar(p, time), p.idx + 1)) {
-      if (!this.admit(symbol, i)) continue;
-      const r = this.broker.submit(i, time);
-      if (!r.accepted) this.onRejected(symbol, { stage: 'submit', orderId: i.id, time, reason: r.reason });
+    const fundingApplied: Record<string, number> = through === null ? {} : { [symbol]: through };
+    if (fills.length === 0 && through === null) return;
+    if (fills.length > 0) {
+      const bar = this.formingBar(p, time);
+      for (const intent of p.layer.onFills(fills, bar, p.idx + 1)) {
+        const i = this.admit(symbol, intent);
+        if (!i) continue;
+        const r = this.broker.submit(i, time);
+        if (!r.accepted) this.onRejected(symbol, { stage: 'submit', orderId: i.id, time, reason: r.reason });
+        else if (i.type === 'market') this.liveMarket.set(symbol, Math.min(this.liveMarket.get(symbol) ?? Infinity, bar.openTime));
+      }
+      for (const x of pendingAfterLiveFill(this.o.funding, symbol, before, this.broker.position(symbol), p.fundingThrough, time)) {
+        this.pendingFunding.push(x);
+        this.log('warning', symbol, { reason: 'funding_pending', time: x.time, qty: x.qty });
+      }
     }
-    if (!this.commit(this.ledger.lastClose, [], new Set([symbol]), {}, time)) void this.exclusive(() => this.reload());
+    if (!this.commit(this.ledger.lastClose, [], new Set([symbol]), fundingApplied, time)) void this.exclusive(() => this.reload());
   }
 
   /** The bar that is forming now (live fills between closes belong to it). */
@@ -414,19 +510,33 @@ export class ScannerRun {
 
   /** The hourly universe: delisted pairs close their positions and leave; new (or still too young) pairs warm up. */
   async applyUniverse(next: PairInfo[], volumes: Map<string, number>): Promise<void> {
-    const additions = await this.exclusive(() => {
-      if (this.stopped) return [];
+    if (this.stopped) return;
+    const keep = new Set(next.map((i) => i.symbol));
+    // 1. Delistings, committed before anything else (and before the feed drops their streams).
+    await this.exclusive(async () => {
+      if (this.stopped) return;
       this.volumes = new Map(volumes);
-      const keep = new Set(next.map((i) => i.symbol));
-      const touched = new Set<string>();
-      for (const p of [...this.pairs.values()]) if (!keep.has(p.info.symbol)) this.delist(p, touched);
       for (const s of [...this.pending.keys()]) if (!keep.has(s)) this.pending.delete(s);
-      if (touched.size > 0 && !this.commit(this.ledger.lastClose, [], touched, {}, this.o.now())) return this.reload().then(() => []);
-      return next.filter((i) => !this.pairs.has(i.symbol) && this.pending.get(i.symbol)?.reason !== 'loading');
+      // A rejected commit reloads the saved state, where the delisted pairs still hold their positions: delist again.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const gone = [...this.pairs.values()].filter((p) => !keep.has(p.info.symbol));
+        if (gone.length === 0) break;
+        const touched = new Set<string>();
+        for (const p of gone) this.delist(p, touched);
+        if (this.commit(this.ledger.lastClose, [], touched, {}, this.o.now())) {
+          for (const p of gone) this.pairs.delete(p.info.symbol); // dropped once their forceClose is committed
+          break;
+        }
+        await this.reload();
+      }
     });
+    // 2. The feed follows at once; 3. new listings warm up and join one by one (each updates the feed again).
+    this.o.onSymbolsChanged?.();
+    const additions = next.filter((i) => !this.pairs.has(i.symbol) && this.pending.get(i.symbol)?.reason !== 'loading');
     if (additions.length > 0) await this.warm(this.byVolume(additions), 'refresh');
   }
 
+  /** Closes a leaving pair's position at its last price and retires its layer and instance (removed after the commit). */
   private delist(p: Pair, touched: Set<string>): void {
     const symbol = p.info.symbol;
     const hadPosition = this.broker.position(symbol) !== null;
@@ -436,7 +546,8 @@ export class ScannerRun {
     if (fills.length > 0) p.layer.onFills(fills, this.formingBar(p, now), p.idx + 1);
     p.layer.onDelisted();
     p.inst?.dispose();
-    this.pairs.delete(symbol);
+    p.inst = null;
+    this.liveMarket.delete(symbol);
     touched.add(symbol);
     this.log('delisting', symbol, { hadPosition, price });
   }
@@ -470,17 +581,22 @@ export class ScannerRun {
     this.background.add(task);
   }
 
-  /** Warm the pair's instance up again on the stored history (its layer and the broker are kept). Holds the lock. */
-  private async rewarm(p: Pair, reason: string): Promise<void> {
+  /**
+   * Warm the pair's instance up again on the stored history (its layer and the broker are kept). Holds the lock. The
+   * history ends at `through` (a reload: the last bar the database has processed, so later bars are stepped again),
+   * else at the newest stored closed bar.
+   */
+  private async rewarm(p: Pair, reason: string, through?: number): Promise<void> {
     const symbol = p.info.symbol;
     const latest = this.o.candles.latest(symbol, this.o.setup.tf);
-    const to = Math.min(latest?.openTime ?? p.last.openTime, barOpenFor(this.o.now(), this.o.setup.tf) - this.tfMs);
+    const newest = Math.min(latest?.openTime ?? p.last.openTime, barOpenFor(this.o.now(), this.o.setup.tf) - this.tfMs);
+    const to = through === undefined ? newest : Math.min(through, newest);
     const history = contiguousTail(this.o.candles.range(symbol, this.o.setup.tf, to - (this.bars - 1) * this.tfMs, to), this.o.setup.tf);
     if (history.length < this.required()) return;
     const htf = this.htfFromRepo(symbol, history);
     p.inst?.dispose();
     const fresh = await this.build(p.info, p.layer, { history, htf });
-    Object.assign(p, { inst: fresh.inst, funding: fresh.funding, last: fresh.last, idx: fresh.idx });
+    Object.assign(p, { inst: fresh.inst, funding: fresh.funding, last: fresh.last, idx: fresh.idx, warmEnd: through === undefined ? fresh.last.openTime : p.warmEnd });
     // After a reload every pair is re-warmed: the one state_reloaded warning says so.
     if (reason !== 'state_reloaded') this.log('warning', symbol, { reason: 'rewarm', why: reason, lastStepped: fresh.last.openTime });
   }
@@ -499,25 +615,32 @@ export class ScannerRun {
     return this.ledger.commit({ broker: this.broker, layers: this.layers, close, processed, touched, fundingApplied, equityTime });
   }
 
-  /** Memory was ahead of the database: reload broker and layers from loadState() and rebuild every instance. */
+  /**
+   * Memory and the database disagree: reload broker and layers from loadState() and rebuild every instance. Each pair
+   * rolls back to the database's view: its instance is warmed up through the last bar the database has processed for
+   * it (or its first warm-up end), so bars stepped in a rejected pass are stepped again from the stored candles at the
+   * next close. A pair flagged `error` stays flagged (no instance). Live-fill bookkeeping is dropped with the state.
+   */
   private async reload(): Promise<void> {
     const state = this.o.repo.loadState(this.runId);
     for (const p of this.pairs.values()) p.inst?.dispose();
     this.broker = state ? PaperBroker.restore(state.broker, this.brokerOptions()) : new PaperBroker(this.brokerOptions());
     this.brokerGen++;
     this.ledger.reset(this.broker, state?.lastClose ?? 0);
+    this.liveMarket.clear();
+    this.pendingFunding = [];
     for (const p of [...this.pairs.values()]) {
       const symbol = p.info.symbol;
       const saved = state?.layers[symbol];
-      const from = p.last.openTime + this.tfMs;
-      const opts = { rules: p.info.rules, from };
+      const through = this.o.repo.lastProcessed(this.runId, symbol) ?? p.warmEnd;
+      const opts = { rules: p.info.rules, from: through + this.tfMs };
       p.layer = saved ? StrategyLayer.restore(saved, this.decl!, this.broker, symbol, this.broker.sizingRule(), opts) : new StrategyLayer(this.decl!, this.broker, symbol, this.broker.sizingRule(), opts);
       this.layers.set(symbol, p.layer);
       this.ledger.track(symbol, p.layer);
       p.inst = null;
-      p.state = 'ok';
       p.fundingThrough = this.o.repo.appliedThrough(this.runId, symbol);
-      await this.rewarm(p, 'state_reloaded');
+      if (p.state === 'error') continue;
+      await this.rewarm(p, 'state_reloaded', through);
       if (!p.inst) {
         // Too little stored history to warm up on: it waits for the next universe refresh like a young pair.
         this.pairs.delete(symbol);
@@ -530,8 +653,23 @@ export class ScannerRun {
 
   // ---------------------------------------------------------------- control ----
 
-  pause(): void {
+  /**
+   * From now on entries are dropped (admit). Resting entry orders (not reduce-only) are cancelled now, each logged
+   * paused_entry_dropped; exits, stops, liquidation and funding carry on.
+   */
+  async pause(): Promise<void> {
     this.paused = true;
+    await this.exclusive(() => {
+      if (this.stopped) return;
+      const touched = new Set<string>();
+      for (const o of this.broker.openOrders()) {
+        if (o.tag !== 'entry' || o.reduceOnly) continue;
+        this.broker.cancel(o.id);
+        touched.add(o.symbol);
+        this.log('paused_entry_dropped', o.symbol, { orderId: o.id, side: o.side, type: o.type, resting: true });
+      }
+      if (touched.size > 0 && !this.commit(this.ledger.lastClose, [], touched, {}, this.o.now())) return this.reload();
+    });
   }
 
   resume(): void {

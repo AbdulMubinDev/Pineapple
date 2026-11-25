@@ -140,6 +140,8 @@ export class RunRepo {
       ),
       processed: p('INSERT OR IGNORE INTO processed_candles (run_id, symbol, open_time) VALUES (?, ?, ?)'),
       isProcessed: p('SELECT 1 AS hit FROM processed_candles WHERE run_id = ? AND symbol = ? AND open_time = ?'),
+      lastProcessed: p('SELECT MAX(open_time) AS t FROM processed_candles WHERE run_id = ? AND symbol = ?'),
+      activeRuns: p("SELECT COUNT(*) AS n FROM runs WHERE status IN ('running', 'paused')"),
       addTrade: p(
         `INSERT INTO trades (run_id, symbol, side, entry_time, entry_price, exit_time, exit_price, qty, pnl, fees, funding, exit_reason, exit_order_id, overfill)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -249,6 +251,17 @@ export class RunRepo {
 
   isProcessed(runId: number, symbol: string, openTime: number): boolean {
     return this.s.isProcessed!.get(runId, symbol, openTime) !== undefined;
+  }
+
+  /** The newest processed kline openTime of (run, symbol), or null when none is. */
+  lastProcessed(runId: number, symbol: string): number | null {
+    const r = this.s.lastProcessed!.get(runId, symbol) as { t: number | null } | undefined;
+    return r?.t ?? null;
+  }
+
+  /** Runs whose status is running or paused (each holds a RUN_LIMIT slot). */
+  activeRuns(): number {
+    return (this.s.activeRuns!.get() as { n: number }).n;
   }
 
   /** Funding applied through this time for (run, symbol); 0 when none has been. */
