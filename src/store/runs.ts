@@ -86,6 +86,29 @@ interface TradeRow {
   overfill: number;
 }
 
+/** A pass re-ran klines already committed for the run: nothing of it was written. */
+export class DuplicatePassError extends Error {
+  constructor(
+    readonly runId: number,
+    readonly keys: { symbol: string; openTime: number }[],
+  ) {
+    super(`run ${runId}: pass rejected, already processed: ${keys.map((k) => `${k.symbol}@${k.openTime}`).join(', ')}`);
+    this.name = 'DuplicatePassError';
+  }
+}
+
+/** A pass closes before the run's saved last close (out of order): nothing of it was written. */
+export class StalePassError extends Error {
+  constructor(
+    readonly runId: number,
+    readonly close: number,
+    readonly lastClose: number,
+  ) {
+    super(`run ${runId}: pass for close ${close} is before the last committed close ${lastClose}`);
+    this.name = 'StalePassError';
+  }
+}
+
 const json = (x: unknown, what: string): string => JSON.stringify(plainCopy(x, what));
 
 const finite = (n: number, what: string): number => {
@@ -167,7 +190,7 @@ export class RunRepo {
       if (!run) throw new Error(`no run ${runId}`);
       const old = run.setup[field];
       this.s.setSetup!.run(json({ ...run.setup, [field]: value }, 'run setup'), runId);
-      this.s.addSetting!.run(runId, this.now(), field, JSON.stringify(old), newJson);
+      this.s.addSetting!.run(runId, this.now(), field, JSON.stringify(old ?? null), newJson);
     });
   }
 
@@ -183,12 +206,15 @@ export class RunRepo {
   // ---------------------------------------------------------- passes ----
 
   /**
-   * Stores one scanner pass in ONE transaction: its processed kline keys, broker and layer state, trades,
-   * equity point, logs and funding applied-through times. A kline key already processed is a duplicate:
-   * nothing of the pass is committed for that pair (its layer, trades, logs and funding time are left as they
-   * were) and it is returned in `duplicates`. State JSON cannot hold (NaN, Infinity) is refused up front.
+   * Stores one scanner pass in ONE transaction, all or nothing: its processed kline keys, broker and layer
+   * state, trades, equity point, logs and funding applied-through times. It throws, writing nothing, when
+   *  - a kline key of the pass is already processed (DuplicatePassError, listing the keys);
+   *  - the pass's close is before the saved last close (StalePassError);
+   *  - the state cannot be held as JSON (NaN, Infinity), or any write fails.
+   * After a rejected commit the caller's in-memory broker and layers are ahead of the database: it must
+   * reload them from loadState() (and rebuild its instances) before stepping again.
    */
-  commitPass(runId: number, p: PassCommit): { duplicates: { symbol: string; openTime: number }[] } {
+  commitPass(runId: number, p: PassCommit): void {
     const brokerJson = json(p.broker, 'broker state');
     const layers = plainCopy(p.layers, 'layer state');
     const logs = p.logs.map((l) => ({ ...l, detailJson: l.detail === undefined ? null : json(l.detail, `log ${l.kind}`) }));
@@ -197,34 +223,27 @@ export class RunRepo {
     for (const t of p.trades) for (const k of ['entryTime', 'entryPrice', 'exitTime', 'exitPrice', 'qty', 'pnl', 'fees', 'funding'] as const) finite(t[k], `trade ${k}`);
     for (const [s, t] of Object.entries(p.fundingApplied)) finite(t, `funding applied for ${s}`);
 
-    return inTransaction(this.db, () => {
-      const duplicates: { symbol: string; openTime: number }[] = [];
-      const skip = new Set<string>();
-      for (const k of p.processed) {
-        if (Number(this.s.processed!.run(runId, k.symbol, k.openTime).changes) === 0) {
-          duplicates.push(k);
-          skip.add(k.symbol);
-        }
-      }
-      // A symbol with a duplicate key AND a fresh one in the same pass is still skipped: the pass re-ran it.
+    inTransaction(this.db, () => {
       const prev = this.loadState(runId);
-      const merged: Record<string, LayerState> = { ...(prev?.layers ?? {}) };
-      for (const [s, l] of Object.entries(layers)) if (!skip.has(s)) merged[s] = l;
+      if (prev && p.close < prev.lastClose) throw new StalePassError(runId, p.close, prev.lastClose);
+      const duplicates: { symbol: string; openTime: number }[] = [];
+      for (const k of p.processed) {
+        if (Number(this.s.processed!.run(runId, k.symbol, k.openTime).changes) === 0) duplicates.push(k);
+      }
+      // Rolls the whole pass back (the keys inserted above included): the broker state is global, so no part
+      // of a pass that re-ran a kline can be kept.
+      if (duplicates.length > 0) throw new DuplicatePassError(runId, duplicates);
+      const merged: Record<string, LayerState> = { ...(prev?.layers ?? {}), ...layers };
       this.s.putState!.run(runId, p.close, brokerJson, JSON.stringify(merged), this.now());
       for (const t of p.trades) {
-        if (skip.has(t.symbol)) continue;
         this.s.addTrade!.run(
           runId, t.symbol, t.side, t.entryTime, t.entryPrice, t.exitTime, t.exitPrice, t.qty, t.pnl, t.fees, t.funding,
           t.exitReason, t.exitOrderId ?? null, t.overfill ? 1 : 0,
         );
       }
       this.s.putEquity!.run(runId, p.equity.time, p.equity.equity);
-      for (const l of logs) {
-        if (l.symbol !== undefined && skip.has(l.symbol)) continue;
-        this.s.addLog!.run(runId, l.time, l.kind, l.symbol ?? null, l.detailJson);
-      }
-      for (const [s, t] of Object.entries(p.fundingApplied)) if (!skip.has(s)) this.s.putFunding!.run(runId, s, t);
-      return { duplicates };
+      for (const l of logs) this.s.addLog!.run(runId, l.time, l.kind, l.symbol ?? null, l.detailJson);
+      for (const [s, t] of Object.entries(p.fundingApplied)) this.s.putFunding!.run(runId, s, t);
     });
   }
 

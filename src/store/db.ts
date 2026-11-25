@@ -64,6 +64,8 @@ const MIGRATIONS: readonly string[] = [
      symbol TEXT NOT NULL, through_time INTEGER NOT NULL,
      PRIMARY KEY (run_id, symbol)
    ) WITHOUT ROWID;`,
+  // 3: the whole run log of a run, in order (logs(runId) without a kind).
+  `CREATE INDEX run_log_run_id ON run_log (run_id, id);`,
 ];
 
 /**

@@ -66,9 +66,18 @@ export class FeedStore {
     if (!last) return;
     for (const [key, s] of this.series) {
       const end = s.rows[s.rows.length - 1];
-      if (!end || end.openTime !== bucketOpen(last.openTime, s.period)) {
+      const open = bucketOpen(last.openTime, s.period);
+      if (!end || end.openTime !== open) {
         throw new Error(`FeedStore: the ${key} candles must end with the bucket of the last history bar (${last.openTime})`);
       }
+      // The developing bucket must be built from closed bars only: it ends at the last history bar's close, and
+      // its range is that of the history bars in it (exactly, when the history holds the whole bucket so far).
+      const inBucket = history.filter((c) => c.openTime >= open);
+      const high = Math.max(...inBucket.map((c) => c.high));
+      const low = Math.min(...inBucket.map((c) => c.low));
+      const whole = history[0]!.openTime <= open;
+      const ok = end.close === last.close && (whole ? end.high === high && end.low === low && end.open === inBucket[0]!.open : end.high >= high && end.low <= low);
+      if (!ok) throw new Error(`FeedStore: the last ${key} candle (${end.openTime}) is not the aggregate of the closed history bars in it`);
     }
   }
 
@@ -741,7 +750,12 @@ export interface ResidentOptions {
   rules: PairRules;
   /** Closed chart bars, oldest first, contiguous: the warm start runs over all of them. */
   history: Candle[];
-  /** Per request.security timeframe (compileScript's securityTimeframes): its candles, ending with the bucket of the last history bar. */
+  /**
+   * Per request.security timeframe (compileScript's securityTimeframes): its candles, ending with the bucket
+   * of the last history bar. They must be `aggregateCandles(history, tf)`, or the same built from stored
+   * CLOSED chart bars reaching further back: never an exchange kline of the timeframe, whose developing bar
+   * includes the unclosed chart bar. FeedStore rejects a last bucket that is not the closed bars' aggregate.
+   */
   htf: Record<string, Candle[]>;
   /** The only callbacks. `from` must be after the history, so warm-up bars see a flat account (as in replay). */
   hooks: BarHooks;
@@ -767,18 +781,22 @@ export class ResidentStrategy {
   private busy = false;
   private disposed = false;
   private failed: unknown = null;
-  private core!: ResidentInstance;
+  private core: ResidentInstance | null = null;
+  private store: FeedStore | null;
+  private hooks: BarHooks | null;
 
   /** The warm-up history, dropped once the warm start is done (the store keeps only what stepping needs). */
   private warm: Candle[] | null;
-  private readonly o: Pick<ResidentOptions, 'symbol' | 'tf' | 'keep' | 'htfKeep' | 'hooks'>;
+  private readonly o: Pick<ResidentOptions, 'symbol' | 'tf' | 'keep' | 'htfKeep'>;
 
   private constructor(
     o: ResidentOptions,
-    private readonly store: FeedStore,
+    store: FeedStore,
     private readonly source: string,
   ) {
-    this.o = { symbol: o.symbol, tf: o.tf, keep: o.keep, htfKeep: o.htfKeep, hooks: o.hooks };
+    this.o = { symbol: o.symbol, tf: o.tf, keep: o.keep, htfKeep: o.htfKeep };
+    this.store = store;
+    this.hooks = o.hooks;
     this.warm = o.history;
   }
 
@@ -840,27 +858,28 @@ export class ResidentStrategy {
     this.lastIdx = idx;
     const bar = this.barAt(idx);
     if (time !== bar.openTime) throw new Error(`ResidentStrategy(${this.o.symbol}): PineTS bar ${idx} is not candle ${bar.openTime}`);
-    return toBrokerView(this.o.hooks.before(bar, idx));
+    return toBrokerView(this.live().hooks.before(bar, idx));
   }
 
   private after(idx: number, calls: OrderCall[]): void {
-    this.o.hooks.after(this.barAt(idx), idx, calls.map((c) => toPineOrderCall(c.method, c.args)));
+    this.live().hooks.after(this.barAt(idx), idx, calls.map((c) => toPineOrderCall(c.method, c.args)));
   }
 
   /** Runs hooks.before, the script and hooks.after for one new closed bar (the next after the last one). */
   async step(bar: Candle): Promise<void> {
-    if (this.disposed) throw new Error(`ResidentStrategy(${this.o.symbol}): disposed`);
+    const { store, core } = this.live();
     if (this.failed) throw new Error(`ResidentStrategy(${this.o.symbol}): an earlier step failed: ${String(this.failed)}`);
     if (this.busy) throw new Error(`ResidentStrategy(${this.o.symbol}): step() while a step is running`);
-    const last = this.store.chart[this.store.chart.length - 1]!;
+    const last = store.chart[store.chart.length - 1]!;
     const tfMs = tfToMs(this.o.tf);
     if (bar.openTime !== last.openTime + tfMs) throw new Error(`ResidentStrategy(${this.o.symbol}): bar ${bar.openTime} does not follow ${last.openTime}`);
     this.busy = true;
     try {
       this.current = bar;
-      this.store.append(bar);
-      await this.core.step();
-      this.store.trim(this.o.keep, this.o.htfKeep);
+      store.append(bar);
+      if (!core) throw new Error(`ResidentStrategy(${this.o.symbol}): not created`);
+      await core.step();
+      store.trim(this.o.keep, this.o.htfKeep);
     } catch (e) {
       this.failed = e instanceof Error ? e.message : e;
       throw e;
@@ -871,21 +890,34 @@ export class ResidentStrategy {
 
   /** How much history the instance and its candle store hold (for bounds checks and monitoring). */
   held(): HeldHistory & { storeChart: number; storeHtf: number } {
-    const s = this.store.sizes();
-    return { ...this.core.held(), storeChart: s.chart, storeHtf: s.htf };
+    const { store, core } = this.live();
+    const s = store.sizes();
+    return { ...core!.held(), storeChart: s.chart, storeHtf: s.htf };
   }
 
   /** The newest value of plot `title` (plots keep only their last entries). */
   lastPlot(title: string): unknown {
-    const d = this.core.ctx?.plots[title]?.data;
+    const d = this.live().core?.ctx?.plots[title]?.data;
     return d?.[d.length - 1]?.value;
   }
 
+  /** Ends the instance and drops everything it holds. Not while a step is running (await it first). */
   dispose(): void {
     if (this.disposed) return;
+    if (this.busy) throw new Error(`ResidentStrategy(${this.o.symbol}): dispose() while a step is running`);
     this.disposed = true;
     this.core?.close();
+    this.core = null;
+    this.store = null;
+    this.hooks = null;
+    this.current = null;
+    this.warm = null;
     this.release();
+  }
+
+  private live(): { store: FeedStore; core: ResidentInstance | null; hooks: BarHooks } {
+    if (this.disposed || !this.store || !this.hooks) throw new Error(`ResidentStrategy(${this.o.symbol}): disposed`);
+    return { store: this.store, core: this.core, hooks: this.hooks };
   }
 
   private release(): void {
@@ -903,6 +935,16 @@ const BOUND_FACTOR = 3;
 const KEYWORDS = new Set(['and', 'or', 'not', 'if', 'else', 'for', 'to', 'by', 'in', 'while', 'switch', 'var', 'varip', 'return', 'export', 'import', 'method', 'type']);
 
 type Ref = { line: number; offset: number | null };
+
+export interface ScriptBounds {
+  keep: number;
+  htfKeep: number;
+  /**
+   * What the script reads that behaves differently live (a static scan; comments and strings ignored):
+   * barstate.* (every stepped bar is the last, realtime one) and bar_index (it counts from the warm start).
+   */
+  uses: { barstate: boolean; barIndex: boolean };
+}
 
 /** Every `x[n]` history reference in `lines` (comments and strings blanked); offset null = not a literal. */
 function historyRefs(lines: string[], firstLine = 1): Ref[] {
@@ -955,7 +997,7 @@ function definedNames(lines: string[]): Set<string> {
  * longest n (PineTS evaluates the script in the request.security context). An offset that is not an
  * integer literal (an input, a runtime expression) cannot be bounded.
  */
-export function scriptBounds(source: string): { keep: number; htfKeep: number } | { error: string } {
+export function scriptBounds(source: string): ScriptBounds | { error: string } {
   const lines = codeLines(source);
   const refs = historyRefs(lines);
   const bad = refs.find((r) => r.offset === null);
@@ -970,5 +1012,10 @@ export function scriptBounds(source: string): { keep: number; htfKeep: number } 
     const usesScript = [...expr.matchAll(/(?<![\w.])([A-Za-z_]\w*)(?![\w])/g)].some((m) => names.has(m[1]!));
     htfLongest = Math.max(htfLongest, usesScript ? longest : 0, ...own.map((r) => r.offset!));
   }
-  return { keep: Math.max(KEEP_FLOOR, BOUND_FACTOR * longest), htfKeep: Math.max(HTF_KEEP_FLOOR, BOUND_FACTOR * htfLongest) };
+  const uses = (re: RegExp) => lines.some((l) => re.test(l));
+  return {
+    keep: Math.max(KEEP_FLOOR, BOUND_FACTOR * longest),
+    htfKeep: Math.max(HTF_KEEP_FLOOR, BOUND_FACTOR * htfLongest),
+    uses: { barstate: uses(/(?<![\w.])barstate\./), barIndex: uses(/(?<![\w.])bar_index(?!\w)/) },
+  };
 }

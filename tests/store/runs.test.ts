@@ -5,7 +5,7 @@ import type { BrokerState, ClosedTrade, PairRules } from '../../src/core/types.j
 import type { StrategyDeclaration } from '../../src/engine/pine-runner.js';
 import { StrategyLayer } from '../../src/engine/strategy-layer.js';
 import { openDb } from '../../src/store/db.js';
-import { RunRepo, type PassCommit, type RunSetup } from '../../src/store/runs.js';
+import { DuplicatePassError, RunRepo, StalePassError, type PassCommit, type RunSetup } from '../../src/store/runs.js';
 
 const rules: PairRules = {
   symbol: 'BTCUSDT',
@@ -85,7 +85,7 @@ const count = (table: string) => (db.prepare(`SELECT COUNT(*) AS n FROM ${table}
 
 describe('RunRepo: runs and settings', () => {
   it('migrates to a new schema version without touching the candle tables', () => {
-    expect((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(2);
+    expect((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(3);
     for (const t of ['candles', 'funding', 'runs', 'settings_history', 'run_state', 'processed_candles', 'trades', 'equity', 'run_log', 'funding_applied']) {
       expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(t), t).toBeDefined();
     }
@@ -122,6 +122,12 @@ describe('RunRepo: runs and settings', () => {
     ]);
     expect(() => repo.recordSetting(id, 'startingBalance', NaN)).toThrow(/NaN/);
     expect(repo.settingsHistory(id)).toHaveLength(2);
+    // A field the stored setup did not have yet: its old value is recorded as null.
+    const older: Partial<RunSetup> = { ...setup };
+    delete older.exchange;
+    const old = repo.createRun({ name: 'older', setup: older as RunSetup });
+    repo.recordSetting(old, 'exchange', 'binance');
+    expect(repo.settingsHistory(old).at(-1)).toMatchObject({ field: 'exchange', old: null, new: 'binance' });
   });
 });
 
@@ -198,26 +204,57 @@ describe('RunRepo: passes', () => {
     expect(count('processed_candles') + count('trades') + count('equity') + count('run_log')).toBe(0);
   });
 
-  it('duplicate closed kline is ignored: once a key is committed, a second pass for it commits nothing for that pair', () => {
+  /** Every row the run has, byte for byte (the JSON columns as stored). */
+  const snapshotDb = () =>
+    ['run_state', 'processed_candles', 'trades', 'equity', 'run_log', 'funding_applied'].map((t) => db.prepare(`SELECT * FROM ${t} ORDER BY 1, 2, 3`).all());
+
+  it('duplicate closed kline is rejected: a second pass for a committed key throws and writes nothing', () => {
     const id = repo.createRun({ name: 'alpha', setup });
     const close = T0 + 10 * H4;
     repo.commitPass(id, pass(close, ['BTCUSDT']));
     expect(repo.isProcessed(id, 'BTCUSDT', close - H4)).toBe(true);
-    const firstLayer = repo.loadState(id)!.layers.BTCUSDT;
+    const before = snapshotDb();
+    const state = repo.loadState(id);
 
-    // The same kline again, alongside a new pair.
-    const again = pass(close, ['BTCUSDT', 'ETHUSDT'], { fundingApplied: { BTCUSDT: close + 5 * H4, ETHUSDT: close - H4 } });
-    again.layers.BTCUSDT = { ...again.layers.BTCUSDT!, seq: 77 };
-    const r = repo.commitPass(id, again);
-    expect(r.duplicates).toEqual([{ symbol: 'BTCUSDT', openTime: close - H4 }]);
-    const s = repo.loadState(id)!;
-    expect(s.layers.BTCUSDT).toEqual(firstLayer);
-    expect(s.layers.ETHUSDT).toEqual(again.layers.ETHUSDT);
-    expect(repo.trades(id).map((t) => t.symbol)).toEqual(['BTCUSDT', 'ETHUSDT']);
-    expect(repo.logs(id).map((l) => l.symbol)).toEqual(['BTCUSDT', 'ETHUSDT']);
-    expect(repo.appliedThrough(id, 'BTCUSDT')).toBe(close - H4);
-    expect(repo.appliedThrough(id, 'ETHUSDT')).toBe(close - H4);
-    expect(count('processed_candles')).toBe(2);
+    // The same kline again, with a different broker state.
+    const { broker } = brokerAndLayer();
+    broker.markToMarket('BTCUSDT', 999);
+    now += 1;
+    let err: unknown;
+    try {
+      repo.commitPass(id, pass(close, ['BTCUSDT'], { broker: broker.snapshot() }));
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(DuplicatePassError);
+    expect((err as DuplicatePassError).keys).toEqual([{ symbol: 'BTCUSDT', openTime: close - H4 }]);
+    expect(snapshotDb()).toEqual(before);
+    expect(repo.loadState(id)).toEqual(state);
+  });
+
+  it('a mixed pass (one duplicate key, one fresh) throws and writes nothing, the fresh key included', () => {
+    const id = repo.createRun({ name: 'alpha', setup });
+    const close = T0 + 10 * H4;
+    repo.commitPass(id, pass(close, ['BTCUSDT']));
+    const before = snapshotDb();
+    const mixed = pass(close, ['ETHUSDT', 'BTCUSDT']);
+    expect(() => repo.commitPass(id, mixed)).toThrow(DuplicatePassError);
+    expect(() => repo.commitPass(id, mixed)).toThrow(/BTCUSDT@/);
+    expect(snapshotDb()).toEqual(before);
+    expect(repo.isProcessed(id, 'ETHUSDT', close - H4)).toBe(false);
+    expect(repo.appliedThrough(id, 'ETHUSDT')).toBe(0);
+  });
+
+  it('a stale pass (close before the last committed close) is rejected and writes nothing', () => {
+    const id = repo.createRun({ name: 'alpha', setup });
+    const close = T0 + 10 * H4;
+    repo.commitPass(id, pass(close, ['BTCUSDT']));
+    const before = snapshotDb();
+    expect(() => repo.commitPass(id, pass(close - H4, ['ETHUSDT']))).toThrow(StalePassError);
+    expect(snapshotDb()).toEqual(before);
+    // The same close again (another pair's late kline) is not stale.
+    repo.commitPass(id, pass(close, ['ETHUSDT']));
+    expect(repo.isProcessed(id, 'ETHUSDT', close - H4)).toBe(true);
   });
 
   it('the funding applied-through time never moves back', () => {

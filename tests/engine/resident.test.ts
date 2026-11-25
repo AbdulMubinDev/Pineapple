@@ -47,7 +47,7 @@ describe('resident stepping', () => {
     const fees = { makerRate: tv.commissionPct / 100, takerRate: tv.commissionPct / 100, slippagePct: 0, slippageTicks: tv.slippageTicks };
     const sizing = { kind: 'script' as const };
     const broker = new PaperBroker({ startingBalance: tv.initialCapital, fees, mode: 'tradingview', rules: () => rules, sizing });
-    const layer = new StrategyLayer(declaration, broker, 'BTCUSDT', sizing, { rules, from });
+    const layer = new StrategyLayer(declaration, broker, 'BTCUSDT', broker.sizingRule(), { rules, from });
     const equity: { time: number; equity: number }[] = [];
     const hooks = barHooks({
       broker,
@@ -65,9 +65,11 @@ describe('resident stepping', () => {
     const bounds = scriptBounds(kyber);
     if ('error' in bounds) throw new Error(bounds.error);
     const htf = Object.fromEntries(compiled.securityTimeframes.map((t) => [t, aggregateCandles(history, t)]));
-    const inst = await ResidentStrategy.create({ source: kyber, symbol: 'BTCUSDT', tf: '4h', rules, history, htf, hooks, ...bounds });
+    const inst = await ResidentStrategy.create({ source: kyber, symbol: 'BTCUSDT', tf: '4h', rules, history, htf, hooks, keep: bounds.keep, htfKeep: bounds.htfKeep });
     expect(equity).toHaveLength(0); // warm-up bars are not traded
     for (const bar of window.slice(WARM)) await inst.step(bar);
+    // The equality held with the history really trimmed.
+    expect(inst.held().chartBars).toBeLessThanOrEqual(2 * bounds.keep);
     inst.dispose();
 
     const r = await replay({ source: kyber, symbol: 'BTCUSDT', tf: '4h', candles: window, funding: [], from, to, mode: 'tradingview', rules, startingBalance: 10_000, sizing });
@@ -152,6 +154,61 @@ describe('resident stepping', () => {
     await expect(inst.step(candles[101]!)).rejects.toThrow(/does not follow/);
     inst.dispose();
     await expect(inst.step(candles[100]!)).rejects.toThrow(/disposed/);
+    expect(() => inst.held()).toThrow(/disposed/);
+  });
+
+  it('dispose() is refused while a step is running', { timeout: 60_000 }, async () => {
+    const history = candles.slice(0, 100);
+    const inst = await ResidentStrategy.create({ source: probe01, symbol: 'BTCUSDT', tf: '4h', rules, history, htf: {}, hooks: flatHooks(), keep: 100, htfKeep: 50 });
+    const running = inst.step(candles[100]!);
+    expect(() => inst.dispose()).toThrow(/while a step is running/);
+    await running;
+    inst.dispose();
+  });
+
+  it('htf candles must be the aggregate of the closed history bars: a developing bucket with an unclosed bar in it is rejected', { timeout: 60_000 }, async () => {
+    // Bar 100 opens at 16:00 UTC: bar 101 (20:00) is still open, in the same day.
+    const history = candles.slice(0, 101);
+    const make = (D: Candle[]) =>
+      ResidentStrategy.create({ source: kyber, symbol: 'BTCUSDT', tf: '4h', rules, history, htf: { D }, hooks: flatHooks(), keep: 100, htfKeep: 50 });
+    // As an exchange daily kline would be: built with the unclosed bar.
+    const withOpenBar = aggregateCandles(candles.slice(0, 102), 'D');
+    expect(withOpenBar.at(-1)!.openTime).toBe(aggregateCandles(history, 'D').at(-1)!.openTime);
+    await expect(make(withOpenBar)).rejects.toThrow(/not the aggregate of the closed history bars/);
+    const days = aggregateCandles(history, 'D');
+    const wider = [...days.slice(0, -1), { ...days.at(-1)!, high: days.at(-1)!.high + 1 }];
+    await expect(make(wider)).rejects.toThrow(/not the aggregate/);
+    await expect(make(days.slice(0, -1))).rejects.toThrow(/must end with the bucket of the last history bar/);
+    (await make(days)).dispose();
+  });
+
+  it('ta lengths beyond keep are safe (their windows live in taState): ta.highest(close, 150) at keep 100 gives the untrimmed calls', { timeout: 120_000 }, async () => {
+    const src = [
+      '//@version=6',
+      'strategy("hi")',
+      'h = ta.highest(close, 150)',
+      'if close >= h',
+      '    strategy.entry("L", strategy.long)',
+      'if close < h * 0.9',
+      '    strategy.close("L")',
+      '',
+    ].join('\n');
+    const run = async (keep: number) => {
+      const calls: PineOrderCall[][] = [];
+      const hooks: BarHooks = { before: () => StrategyLayer.flatView(10_000), after: (_b, _i, c) => calls.push(c) };
+      const history = candles.slice(0, 400);
+      const inst = await ResidentStrategy.create({ source: src, symbol: 'BTCUSDT', tf: '4h', rules, history, htf: {}, hooks, keep, htfKeep: 50, slack: 20 });
+      for (const bar of candles.slice(400, 1_400)) await inst.step(bar);
+      const held = inst.held().chartBars;
+      inst.dispose();
+      return { calls, held };
+    };
+    const trimmed = await run(100);
+    const full = await run(100_000);
+    expect(trimmed.held).toBeLessThanOrEqual(120);
+    expect(full.held).toBe(1_400);
+    expect(trimmed.calls.flat().length).toBeGreaterThan(20);
+    expect(trimmed.calls).toEqual(full.calls);
   });
 
   it('instances are created one at a time: concurrent create() calls are serialised', { timeout: 120_000 }, async () => {
@@ -199,19 +256,26 @@ describe('scriptBounds', () => {
   });
 
   it('defaults to keep 100 / htfKeep 50, and is 3 x the longest literal offset above that', () => {
-    expect(scriptBounds(script('plot(close)'))).toEqual({ keep: 100, htfKeep: 50 });
-    expect(scriptBounds(script('x = close[50] - close [2]', 'plot(x)'))).toEqual({ keep: 150, htfKeep: 50 });
-    expect(scriptBounds(script('d = request.security(syminfo.tickerid, "D", close[30])', 'plot(d)'))).toEqual({ keep: 100, htfKeep: 90 });
+    expect(scriptBounds(script('plot(close)'))).toMatchObject({ keep: 100, htfKeep: 50 });
+    expect(scriptBounds(script('x = close[50] - close [2]', 'plot(x)'))).toMatchObject({ keep: 150, htfKeep: 50 });
+    expect(scriptBounds(script('d = request.security(syminfo.tickerid, "D", close[30])', 'plot(d)'))).toMatchObject({ keep: 100, htfKeep: 90 });
   });
 
   it('a request.security expression on a script variable or function takes the whole script\'s longest offset', () => {
     const b = scriptBounds(script('f() => close - close[40]', 'v = high[20]', 'd = request.security(syminfo.tickerid, "D", f())', 'plot(d + v)'));
-    expect(b).toEqual({ keep: 120, htfKeep: 120 });
+    expect(b).toMatchObject({ keep: 120, htfKeep: 120 });
   });
 
   it('tuples, array types, strings and comments are not history references', () => {
     const b = scriptBounds(script('float[] xs = array.new<float>()', '[a, b] = request.security(syminfo.tickerid, "D", [close, open])', 's = "close[len]" // high[n]', 'plot(a + b)'));
-    expect(b).toEqual({ keep: 100, htfKeep: 50 });
+    expect(b).toMatchObject({ keep: 100, htfKeep: 50 });
+  });
+
+  it('flags barstate.* and bar_index reads (they behave differently live), ignoring comments and strings', () => {
+    expect(scriptBounds(kyber)).toMatchObject({ uses: { barstate: true, barIndex: false } });
+    expect(scriptBounds(script('plot(close) // barstate.islast bar_index', 's = "bar_index"'))).toMatchObject({ uses: { barstate: false, barIndex: false } });
+    expect(scriptBounds(script('plot(bar_index)'))).toMatchObject({ uses: { barstate: false, barIndex: true } });
+    expect(scriptBounds(script('plot(my_bar_index2)'))).toMatchObject({ uses: { barIndex: false } });
   });
 
   it('close[len] with an input len is rejected, naming its line', () => {
